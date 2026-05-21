@@ -1,0 +1,15 @@
+.env.local
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fls
+*.fdb_latexmk
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+compiled_output/
+pageindex_cache/
+__pycache__/
+.streamlit/secrets.toml
