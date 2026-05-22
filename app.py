@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import logging
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,14 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+
+PAGEINDEX_LOGGER = logging.getLogger("research_copilot.pageindex")
+if not PAGEINDEX_LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    PAGEINDEX_LOGGER.addHandler(_handler)
+PAGEINDEX_LOGGER.setLevel(logging.INFO)
+PAGEINDEX_LOGGER.propagate = False
 
 ROOT = Path(__file__).resolve().parent
 GPT_RESEARCHER_ENGINE_PATH = (ROOT / os.getenv("GPT_RESEARCHER_ENGINE_PATH", "./engines/gpt-researcher")).resolve()
@@ -77,6 +86,19 @@ def load_agent_skill_pack(skills_dir: Path, max_chars: int = 32000) -> str:
         parts.append(block)
         used += len(block)
     return "\n".join(parts).strip()
+
+
+def load_skill_file(skills_dir: Path, file_name: str, max_chars: int = 16000) -> str:
+    path = skills_dir / file_name
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    return text[:max_chars]
 
 
 def list_saved_reports(bib_pdf_dir: Path) -> list[Path]:
@@ -325,6 +347,14 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
+def latest_pageindex_log_path(pdf_name: str) -> str:
+    logs_dir = ROOT / "logs"
+    if not logs_dir.exists():
+        return ""
+    candidates = sorted(logs_dir.glob(f"{pdf_name}_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(candidates[0]) if candidates else ""
+
+
 LATEX_ESCAPE = {
     "\\": r"\textbackslash{}",
     "&": r"\&",
@@ -510,6 +540,48 @@ def pageindex_model_name(settings: dict[str, Any]) -> str:
     return strip_provider_prefix(raw_model, "openai")
 
 
+def strip_ollama_tag(model: str) -> str:
+    model = strip_provider_prefix(model.strip(), "ollama")
+    if model.startswith("ollama/"):
+        return model.split("/", 1)[1]
+    return model
+
+
+def preflight_pageindex_backend(settings: dict[str, Any]) -> None:
+    if settings["backend"] == "Cloud API":
+        if not settings.get("api_key", "").strip():
+            raise RuntimeError(f"Missing {settings['cloud_provider']} API key for PageIndex indexing.")
+        return
+
+    import requests
+
+    base_url = settings.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
+    model_tag = strip_ollama_tag(settings.get("model", ""))
+    if not model_tag:
+        raise RuntimeError("No Ollama model tag provided for PageIndex indexing.")
+
+    PAGEINDEX_LOGGER.info("PageIndex preflight: probing Ollama endpoint %s", base_url)
+    try:
+        response = requests.get(f"{base_url}/api/tags", timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ollama preflight failed at {base_url}. Ensure Ollama is running and reachable before indexing."
+        ) from exc
+
+    models = [str(item.get("name", "")).strip() for item in payload.get("models", []) if item.get("name")]
+    aliases = {name for name in models}
+    aliases.update({name.split(":", 1)[0] for name in models if ":" in name})
+    if model_tag not in aliases:
+        raise RuntimeError(
+            f"Ollama model `{model_tag}` is not installed. Available: {', '.join(models[:12]) or '(none)'}."
+        )
+
+    os.environ["OLLAMA_BASE_URL"] = base_url
+    os.environ["OLLAMA_API_BASE"] = base_url
+
+
 def configure_runtime_env(settings: dict[str, Any]) -> None:
     model_for_researcher = gpt_researcher_model_name(settings)
     safe_retriever = effective_retriever(settings)
@@ -523,6 +595,7 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
     os.environ["CURATE_SOURCES"] = "true" if settings.get("curate_sources", True) else "false"
     os.environ["IMAGE_GENERATION_ENABLED"] = "false"
     os.environ["TEMPERATURE"] = str(settings.get("llm_temperature", 0.2))
+    os.environ["LLM_TIMEOUT_SECONDS"] = str(settings.get("llm_timeout_seconds", 120))
     os.environ["LLM_KWARGS"] = json.dumps(llm_kwargs)
     os.environ["REASONING_EFFORT"] = settings.get("reasoning_effort", "medium")
     os.environ["MAX_SEARCH_RESULTS_PER_QUERY"] = str(settings.get("max_search_results_per_query", 12))
@@ -540,6 +613,10 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
     os.environ["ARXIV_PAGE_SIZE"] = str(settings.get("arxiv_page_size", 25))
     os.environ["ARXIV_DELAY_SECONDS"] = str(settings.get("arxiv_delay_seconds", 4.0))
     os.environ["ARXIV_NUM_RETRIES"] = str(settings.get("arxiv_num_retries", 4))
+    os.environ["PAGEINDEX_LLM_TIMEOUT_SECONDS"] = str(settings.get("pageindex_llm_timeout_seconds", 180))
+    os.environ["PAGEINDEX_LLM_MAX_RETRIES"] = str(settings.get("pageindex_llm_max_retries", 3))
+    os.environ["PAGEINDEX_TEMPERATURE"] = str(settings.get("pageindex_temperature", 0.0))
+    os.environ["PAGEINDEX_TOP_P"] = str(settings.get("pageindex_top_p", 1.0))
 
     embedding = settings.get("embedding_model", "").strip()
     if embedding:
@@ -553,6 +630,11 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
         base_url = settings["ollama_base_url"].strip().rstrip("/")
         os.environ["OLLAMA_BASE_URL"] = base_url
         os.environ["OLLAMA_API_BASE"] = base_url
+        os.environ["PAGEINDEX_OLLAMA_API_BASE"] = base_url
+        os.environ["PAGEINDEX_OLLAMA_NUM_CTX"] = str(settings.get("ollama_num_ctx", 0))
+        os.environ["PAGEINDEX_OLLAMA_TOP_K"] = str(settings.get("ollama_top_k", 0))
+        os.environ["PAGEINDEX_OLLAMA_REPEAT_PENALTY"] = str(settings.get("ollama_repeat_penalty", 0.0))
+        os.environ["PAGEINDEX_OLLAMA_NUM_PREDICT"] = str(settings.get("ollama_num_predict", 0))
         if embedding and embedding.startswith("ollama:"):
             os.environ["EMBEDDING"] = embedding
     elif settings["cloud_provider"] == "DeepSeek":
@@ -566,6 +648,87 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
             os.environ["OPENAI_API_KEY"] = api_key
         if base_url:
             os.environ["OPENAI_BASE_URL"] = base_url
+
+
+def strip_reasoning_prefix(text: str) -> str:
+    if not text:
+        return ""
+    clean = text.strip()
+    # Remove explicit reasoning blocks if present.
+    clean = re.sub(r"<think>[\s\S]*?</think>\s*", "", clean, flags=re.IGNORECASE)
+    # If model started a reasoning block but never emitted a final answer, treat as empty.
+    if clean.lower().startswith("<think>"):
+        return ""
+    return clean.strip()
+
+
+def extract_llm_response_text(response: Any) -> str:
+    try:
+        content = response.choices[0].message.content
+    except Exception:
+        content = ""
+    if content is None:
+        content = ""
+    cleaned = strip_reasoning_prefix(str(content))
+    if cleaned:
+        return cleaned
+
+    # Fallback to dict shape when SDK object shape differs.
+    try:
+        payload = response.model_dump()
+    except Exception:
+        try:
+            payload = dict(response)
+        except Exception:
+            payload = {}
+    choice = (payload.get("choices") or [{}])[0] if isinstance(payload, dict) else {}
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    raw_text = str(message.get("content") or message.get("reasoning_content") or "").strip()
+    return strip_reasoning_prefix(raw_text)
+
+
+def ollama_direct_chat_completion(
+    messages: list[dict[str, str]],
+    settings: dict[str, Any],
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    import requests
+
+    base_url = settings["ollama_base_url"].strip().rstrip("/")
+    endpoint = f"{base_url}/api/chat"
+    model_tag = strip_ollama_tag(settings.get("model", ""))
+    top_p = float(settings.get("llm_top_p", 1.0))
+    timeout_seconds = int(settings.get("llm_timeout_seconds", 120))
+
+    options: dict[str, Any] = {
+        "temperature": temperature,
+        "num_predict": max(64, min(max_tokens, int(settings.get("ollama_num_predict", max_tokens) or max_tokens))),
+    }
+    if 0 < top_p < 1.0:
+        options["top_p"] = top_p
+    num_ctx = int(settings.get("ollama_num_ctx", 0) or 0)
+    top_k = int(settings.get("ollama_top_k", 0) or 0)
+    repeat_penalty = float(settings.get("ollama_repeat_penalty", 0.0) or 0.0)
+    if num_ctx > 0:
+        options["num_ctx"] = num_ctx
+    if top_k > 0:
+        options["top_k"] = top_k
+    if repeat_penalty > 0:
+        options["repeat_penalty"] = repeat_penalty
+
+    payload = {
+        "model": model_tag,
+        "messages": messages,
+        "stream": False,
+        "options": options,
+    }
+    response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
+    response.raise_for_status()
+    data = response.json()
+    content = ((data.get("message") or {}).get("content") or "").strip()
+    return strip_reasoning_prefix(content)
 
 
 def llm_complete(
@@ -583,11 +746,18 @@ def llm_complete(
 
     effective_temperature = float(settings.get("llm_temperature", 0.2) if temperature is None else temperature)
     effective_max_tokens = int(settings.get("llm_max_tokens", 5000) if max_tokens is None else max_tokens)
+    timeout_seconds = int(settings.get("llm_timeout_seconds", 120))
+    local_model = strip_ollama_tag(settings.get("model", "")).lower() if settings.get("backend") == "Local Ollama" else ""
+    is_local_reasoning_model = any(name in local_model for name in ("deepseek-r1", "magistral"))
+    if is_local_reasoning_model:
+        effective_max_tokens = min(effective_max_tokens, 1800)
+        timeout_seconds = max(timeout_seconds, 300)
     kwargs: dict[str, Any] = {
         "model": litellm_model_name(settings),
         "messages": messages,
         "temperature": effective_temperature,
         "max_tokens": effective_max_tokens,
+        "timeout": timeout_seconds,
     }
     top_p = float(settings.get("llm_top_p", 1.0))
     if 0 < top_p < 1.0:
@@ -603,11 +773,46 @@ def llm_complete(
     elif settings["cloud_provider"] == "DeepSeek":
         kwargs["api_key"] = settings.get("api_key", "").strip() or os.getenv("DEEPSEEK_API_KEY")
 
-    response = completion(**kwargs)
+    response = None
+    litellm_error: Exception | None = None
     try:
-        return response.choices[0].message.content or ""
-    except AttributeError:
-        return response["choices"][0]["message"]["content"] or ""
+        response = completion(**kwargs)
+    except Exception as exc:
+        litellm_error = exc
+
+    if response is not None:
+        text = extract_llm_response_text(response)
+        if text:
+            return text
+
+    # Some local reasoning models can timeout or return empty content through OpenAI-compatible wrappers.
+    # Fallback to direct Ollama /api/chat with strict "final answer only" guard and short bounded retries.
+    if settings["backend"] == "Local Ollama":
+        guard_messages = [
+            {
+                "role": "system",
+                "content": "Return only the final answer. Do not include chain-of-thought, reasoning traces, or <think> tags.",
+            },
+            *messages,
+        ]
+        fallback_attempts = 2 if is_local_reasoning_model else 1
+        for attempt in range(1, fallback_attempts + 1):
+            try:
+                fallback_text = ollama_direct_chat_completion(
+                    guard_messages,
+                    settings,
+                    temperature=effective_temperature,
+                    max_tokens=min(effective_max_tokens, 1200 if is_local_reasoning_model else 1800),
+                )
+                if fallback_text:
+                    return fallback_text
+            except Exception:
+                if attempt == fallback_attempts:
+                    break
+
+    if litellm_error:
+        raise RuntimeError(str(litellm_error)) from litellm_error
+    raise RuntimeError("Model returned an empty completion.")
 
 
 def discover_pdfs(bib_pdf_dir: Path) -> list[Path]:
@@ -739,6 +944,16 @@ def build_research_role_prompt() -> str:
         if skill_pack
         else "You are a senior scientific research agent. Produce evidence-grounded research reports with citations."
     )
+
+
+def build_rag_role_prompt() -> str:
+    rag_skill = load_skill_file(AGENT_SKILLS_DIR, "vectorless_tree_reasoning_chat.md")
+    if not rag_skill:
+        return (
+            "You are a vectorless PageIndex research copilot. Reason over semantic tree structure and page-linked evidence. "
+            "Cite all document-grounded claims with [filename :: node_id :: pp. start-end :: title]."
+        )
+    return f"You are a vectorless PageIndex research copilot.\n\n{rag_skill}"
 
 
 PLAN_HELP_TEXT = (
@@ -1002,12 +1217,16 @@ async def run_gpt_researcher(
 
 
 def index_single_pdf(pdf_path: Path, settings: dict[str, Any], paths: RuntimePaths) -> dict[str, Any]:
+    started = time.perf_counter()
+    PAGEINDEX_LOGGER.info("Index request received for `%s`", pdf_path)
     require_runtime_modules(settings)
     configure_runtime_env(settings)
+    preflight_pageindex_backend(settings)
     pdf_hash = sha256_file(pdf_path)
     output_path = paths.pageindex_cache / f"{safe_slug(pdf_path.stem)}__{pdf_hash[:12]}_structure.json"
     if output_path.exists():
-        return {"status": "cached", "pdf": pdf_path, "output": output_path}
+        PAGEINDEX_LOGGER.info("Cache hit for `%s` -> `%s`", pdf_path.name, output_path.name)
+        return {"status": "cached", "pdf": pdf_path, "output": output_path, "log": latest_pageindex_log_path(pdf_path.name)}
 
     try:
         from pageindex import page_index_main
@@ -1027,8 +1246,27 @@ def index_single_pdf(pdf_path: Path, settings: dict[str, Any], paths: RuntimePat
         "if_add_doc_description": "yes",
         "if_add_node_text": "no",
     }
+    PAGEINDEX_LOGGER.info(
+        "PageIndex options for `%s`: model=%s toc_pages=%s max_pages_per_node=%s max_tokens_per_node=%s timeout=%ss retries=%s temperature=%s top_p=%s",
+        pdf_path.name,
+        user_opt["model"],
+        user_opt["toc_check_page_num"],
+        user_opt["max_page_num_each_node"],
+        user_opt["max_token_num_each_node"],
+        settings.get("pageindex_llm_timeout_seconds", 180),
+        settings.get("pageindex_llm_max_retries", 3),
+        settings.get("pageindex_temperature", 0.0),
+        settings.get("pageindex_top_p", 1.0),
+    )
     opt = ConfigLoader().load({key: value for key, value in user_opt.items() if value is not None})
-    tree = page_index_main(str(pdf_path), opt)
+    try:
+        PAGEINDEX_LOGGER.info("Calling PageIndex engine for `%s`", pdf_path.name)
+        tree = page_index_main(str(pdf_path), opt)
+    except Exception as exc:
+        PAGEINDEX_LOGGER.error("PageIndex failed on `%s`: %s", pdf_path.name, exc)
+        PAGEINDEX_LOGGER.error(traceback.format_exc())
+        raise
+
     payload = {
         "schema_version": 1,
         "source_pdf": str(pdf_path),
@@ -1039,7 +1277,9 @@ def index_single_pdf(pdf_path: Path, settings: dict[str, Any], paths: RuntimePat
         "tree": tree,
     }
     atomic_write_json(output_path, payload)
-    return {"status": "indexed", "pdf": pdf_path, "output": output_path}
+    elapsed = time.perf_counter() - started
+    PAGEINDEX_LOGGER.info("Indexed `%s` in %.2fs -> `%s`", pdf_path.name, elapsed, output_path.name)
+    return {"status": "indexed", "pdf": pdf_path, "output": output_path, "log": latest_pageindex_log_path(pdf_path.name)}
 
 
 def write_workspace_manifest(paths: RuntimePaths) -> None:
@@ -1066,8 +1306,35 @@ def write_workspace_manifest(paths: RuntimePaths) -> None:
 
 
 def reindex_workspace(settings: dict[str, Any], paths: RuntimePaths) -> list[dict[str, Any]]:
-    results = [index_single_pdf(pdf_path, settings, paths) for pdf_path in discover_pdfs(paths.bib_pdf)]
+    pdfs = discover_pdfs(paths.bib_pdf)
+    PAGEINDEX_LOGGER.info(
+        "Workspace reindex started: %s PDF(s), backend=%s model=%s cache_dir=%s",
+        len(pdfs),
+        settings.get("backend"),
+        pageindex_model_name(settings),
+        paths.pageindex_cache,
+    )
+    results: list[dict[str, Any]] = []
+    for pdf_path in pdfs:
+        try:
+            results.append(index_single_pdf(pdf_path, settings, paths))
+        except Exception as exc:
+            results.append(
+                {
+                    "status": "error",
+                    "pdf": pdf_path,
+                    "output": None,
+                    "error": str(exc),
+                    "log": latest_pageindex_log_path(pdf_path.name),
+                }
+            )
     write_workspace_manifest(paths)
+    summary = {
+        "indexed": sum(1 for item in results if item["status"] == "indexed"),
+        "cached": sum(1 for item in results if item["status"] == "cached"),
+        "errors": sum(1 for item in results if item["status"] == "error"),
+    }
+    PAGEINDEX_LOGGER.info("Workspace reindex completed: %s", summary)
     return results
 
 
@@ -1280,13 +1547,16 @@ def answer_workspace_question(
     if not payloads:
         return "No PageIndex cache is loaded yet. Add PDFs to the staging room and run PageIndex indexing first."
 
+    rag_role_prompt = build_rag_role_prompt()
     tree_context = build_tree_context(payloads, int(settings["tree_context_budget"]))
     selector_messages = [
         {
             "role": "system",
             "content": (
-                "You are a vectorless PageIndex navigator. Select the most relevant document sections by reasoning "
-                "over the semantic tree only. Return strict JSON with this shape: "
+                f"{rag_role_prompt}\n\n"
+                "Task phase: section selection only.\n"
+                "Select the most relevant document sections by reasoning over the semantic tree only. "
+                "Return strict JSON with this shape: "
                 '{"sections":[{"doc_key":"DOC_1","node_id":"0001","title":"section title","reason":"brief reason"}]}. '
                 "Select no more than 8 sections."
             ),
@@ -1309,9 +1579,10 @@ def answer_workspace_question(
         {
             "role": "system",
             "content": (
-                "You are a research copilot answering from PageIndex structural retrieval. Do not use vector-search "
-                "language, embeddings, nearest neighbors, or similarity scores. Use the supplied semantic tree and "
-                "page-range evidence. Cite every document-grounded claim with [filename :: node_id :: pp. start-end :: title]. "
+                f"{rag_role_prompt}\n\n"
+                "Do not use vector-search language, embeddings, nearest neighbors, or similarity scores. "
+                "Use only the supplied semantic tree and extracted page-range evidence. "
+                "Cite every document-grounded claim with [filename :: node_id :: pp. start-end :: title]. "
                 "If the evidence is insufficient, state exactly what is missing."
             ),
         },
@@ -1655,6 +1926,33 @@ with st.sidebar:
         pageindex_max_tokens_per_node = st.number_input(
             "Max tokens per node", min_value=1000, max_value=100000, step=1000, value=int(os.getenv("PAGEINDEX_MAX_TOKENS_PER_NODE", "20000"))
         )
+        pageindex_llm_timeout_seconds = st.number_input(
+            "PageIndex LLM timeout (seconds)",
+            min_value=20,
+            max_value=1200,
+            step=10,
+            value=env_int("PAGEINDEX_LLM_TIMEOUT_SECONDS", 180),
+        )
+        pageindex_llm_max_retries = st.number_input(
+            "PageIndex LLM retries",
+            min_value=1,
+            max_value=10,
+            value=env_int("PAGEINDEX_LLM_MAX_RETRIES", 3),
+        )
+        pageindex_temperature = st.number_input(
+            "PageIndex temperature",
+            min_value=0.0,
+            max_value=2.0,
+            step=0.05,
+            value=env_float("PAGEINDEX_TEMPERATURE", 0.0),
+        )
+        pageindex_top_p = st.number_input(
+            "PageIndex top-p",
+            min_value=0.05,
+            max_value=1.0,
+            step=0.05,
+            value=env_float("PAGEINDEX_TOP_P", 1.0),
+        )
         tree_context_budget = st.number_input(
             "Tree context char budget", min_value=8000, max_value=250000, step=1000, value=int(os.getenv("TREE_CONTEXT_CHAR_BUDGET", "45000"))
         )
@@ -1664,6 +1962,7 @@ with st.sidebar:
         llm_temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=env_float("TEMPERATURE", 0.2), step=0.05)
         llm_top_p = st.slider("Top-p", min_value=0.05, max_value=1.0, value=env_float("LLM_TOP_P", 0.9), step=0.05)
         llm_max_tokens = st.number_input("Max output tokens", min_value=512, max_value=32000, step=256, value=env_int("LLM_MAX_TOKENS", 6000))
+        llm_timeout_seconds = st.number_input("LLM timeout (seconds)", min_value=15, max_value=900, step=5, value=env_int("LLM_TIMEOUT_SECONDS", 120))
         reasoning_effort = st.selectbox(
             "Reasoning effort",
             ["low", "medium", "high"],
@@ -1708,6 +2007,7 @@ settings = {
     "llm_temperature": float(llm_temperature),
     "llm_top_p": float(llm_top_p),
     "llm_max_tokens": int(llm_max_tokens),
+    "llm_timeout_seconds": int(llm_timeout_seconds),
     "reasoning_effort": reasoning_effort,
     "ollama_num_ctx": int(ollama_num_ctx),
     "ollama_top_k": int(ollama_top_k),
@@ -1735,6 +2035,10 @@ settings = {
     "pageindex_toc_pages": int(pageindex_toc_pages),
     "pageindex_max_pages_per_node": int(pageindex_max_pages_per_node),
     "pageindex_max_tokens_per_node": int(pageindex_max_tokens_per_node),
+    "pageindex_llm_timeout_seconds": int(pageindex_llm_timeout_seconds),
+    "pageindex_llm_max_retries": int(pageindex_llm_max_retries),
+    "pageindex_temperature": float(pageindex_temperature),
+    "pageindex_top_p": float(pageindex_top_p),
     "tree_context_budget": int(tree_context_budget),
 }
 
@@ -1943,23 +2247,30 @@ with tab_search:
                 st.warning("Add PDFs to the staging directory before indexing.")
             else:
                 with st.spinner("PageIndex is building semantic section trees..."):
-                    try:
-                        results = reindex_workspace(settings, paths)
-                        indexed = sum(1 for item in results if item["status"] == "indexed")
-                        cached = sum(1 for item in results if item["status"] == "cached")
+                    results = reindex_workspace(settings, paths)
+                    indexed = sum(1 for item in results if item["status"] == "indexed")
+                    cached = sum(1 for item in results if item["status"] == "cached")
+                    errors = [item for item in results if item["status"] == "error"]
+                    if errors:
+                        st.error(f"PageIndex finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
+                    else:
                         safe_toast("PageIndex tree indices locked and loaded")
                         st.success(f"Indexed {indexed} PDF(s); reused {cached} cached tree(s).")
-                        st.dataframe(
-                            [
-                                {"status": item["status"], "pdf": item["pdf"].name, "cache": str(item["output"])}
-                                for item in results
-                            ],
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    except Exception as exc:
-                        st.error("PageIndex indexing failed.")
-                        st.code(str(exc), language="text")
+                    st.caption("Detailed PageIndex execution logs are printed to terminal and persisted under `./logs/`.")
+                    st.dataframe(
+                        [
+                            {
+                                "status": item["status"],
+                                "pdf": item["pdf"].name,
+                                "cache": str(item["output"]) if item.get("output") else "",
+                                "error": item.get("error", ""),
+                                "log": item.get("log", ""),
+                            }
+                            for item in results
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
 
     # Full-width report viewer (persists across tab switches)
     st.divider()
@@ -1991,24 +2302,50 @@ with tab_chat:
     st.subheader("Workspace Cross-Examination")
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
+    if "pending_chat_question" not in st.session_state:
+        st.session_state["pending_chat_question"] = None
+    if "rag_chat_draft" not in st.session_state:
+        st.session_state["rag_chat_draft"] = ""
 
-    if st.button("Clear conversation", width="content"):
+    toolbar_cols = st.columns([0.24, 0.76])
+    if toolbar_cols[0].button("Clear conversation", width="stretch"):
         st.session_state["chat_messages"] = []
+        st.session_state["pending_chat_question"] = None
+        st.session_state["rag_chat_draft"] = ""
         st.rerun()
+
+    with st.container(border=True):
+        st.markdown("**Ask the indexed workspace**")
+        with st.form("rag_chat_composer", clear_on_submit=True):
+            st.text_area(
+                "Question",
+                key="rag_chat_draft",
+                height=130,
+                placeholder="Ask a high-precision question. Example: Compare weak supervision vs zero-shot methods and cite exact sections/pages.",
+                label_visibility="collapsed",
+            )
+            submit_cols = st.columns([0.22, 0.78])
+            submitted = submit_cols[0].form_submit_button("Ask", type="primary", width="stretch")
+            if submitted:
+                candidate = st.session_state.get("rag_chat_draft", "").strip()
+                if candidate:
+                    st.session_state["pending_chat_question"] = candidate
+                    st.rerun()
 
     for message in st.session_state["chat_messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    question = st.chat_input("Ask a question grounded in the PageIndex tree cache")
-    if question:
-        st.session_state["chat_messages"].append({"role": "user", "content": question})
+    pending_question = st.session_state.get("pending_chat_question")
+    if pending_question:
+        st.session_state["pending_chat_question"] = None
+        st.session_state["chat_messages"].append({"role": "user", "content": pending_question})
         with st.chat_message("user"):
-            st.markdown(question)
+            st.markdown(pending_question)
         with st.chat_message("assistant"):
             with st.spinner("Reasoning over PageIndex section trees..."):
                 try:
-                    answer = answer_workspace_question(question, settings, paths, st.session_state["chat_messages"])
+                    answer = answer_workspace_question(pending_question, settings, paths, st.session_state["chat_messages"])
                     st.markdown(answer)
                 except Exception as exc:
                     answer = f"RAG chat failed:\n\n```text\n{exc}\n```"

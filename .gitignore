@@ -13,3 +13,7 @@ compiled_output/
 pageindex_cache/
 __pycache__/
 .streamlit/secrets.toml
+logs/*.json
+results/
+Screenshot *.png
+today.png
