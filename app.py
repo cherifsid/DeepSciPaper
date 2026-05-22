@@ -220,6 +220,8 @@ class StreamlitResearchLogHandler:
             )
         elif step == "downloading_pdfs":
             self._stage("Downloading verified PDFs", f"{details.get('pdf_urls', 0)} validated PDF links selected.")
+        elif step == "planning_search_strategy":
+            self._stage("Building research plan", "Generating editable search directions before source collection.")
         elif step == "agent_selection":
             self._stage("Planning search strategy", "Preparing source priorities and search facets.")
         elif step == "conducting_research":
@@ -436,6 +438,51 @@ def sanitize_retriever(raw_retriever: str) -> str:
     return ",".join(allowed or ["duckduckgo"])
 
 
+def effective_retriever(settings_or_retriever: dict[str, Any] | str, tavily_key: str | None = None) -> str:
+    if isinstance(settings_or_retriever, dict):
+        raw_retriever = settings_or_retriever.get("retriever", "duckduckgo")
+        tavily_key = settings_or_retriever.get("tavily_api_key", "") or os.getenv("TAVILY_API_KEY", "")
+    else:
+        raw_retriever = settings_or_retriever
+    parts = [item.strip() for item in sanitize_retriever(str(raw_retriever)).split(",") if item.strip()]
+    if (tavily_key or "").strip() and "tavily" not in parts:
+        parts.insert(0, "tavily")
+    return ",".join(parts or ["duckduckgo"])
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def build_llm_kwargs(settings: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    top_p = float(settings.get("llm_top_p", 1.0))
+    if 0 < top_p < 1.0:
+        kwargs["top_p"] = top_p
+
+    if settings["backend"] == "Local Ollama":
+        ollama_options = {
+            "num_ctx": int(settings.get("ollama_num_ctx", 0) or 0),
+            "top_k": int(settings.get("ollama_top_k", 0) or 0),
+            "repeat_penalty": float(settings.get("ollama_repeat_penalty", 0) or 0),
+            "num_predict": int(settings.get("ollama_num_predict", 0) or 0),
+        }
+        for key, value in ollama_options.items():
+            if value:
+                kwargs[key] = value
+    return kwargs
+
+
 def litellm_model_name(settings: dict[str, Any]) -> str:
     raw_model = settings["model"].strip()
     if settings["backend"] == "Local Ollama":
@@ -465,7 +512,8 @@ def pageindex_model_name(settings: dict[str, Any]) -> str:
 
 def configure_runtime_env(settings: dict[str, Any]) -> None:
     model_for_researcher = gpt_researcher_model_name(settings)
-    safe_retriever = sanitize_retriever(settings["retriever"])
+    safe_retriever = effective_retriever(settings)
+    llm_kwargs = build_llm_kwargs(settings)
     os.environ["FAST_LLM"] = model_for_researcher
     os.environ["SMART_LLM"] = model_for_researcher
     os.environ["STRATEGIC_LLM"] = model_for_researcher
@@ -474,6 +522,24 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
     os.environ["LANGUAGE"] = settings.get("language", "english")
     os.environ["CURATE_SOURCES"] = "true" if settings.get("curate_sources", True) else "false"
     os.environ["IMAGE_GENERATION_ENABLED"] = "false"
+    os.environ["TEMPERATURE"] = str(settings.get("llm_temperature", 0.2))
+    os.environ["LLM_KWARGS"] = json.dumps(llm_kwargs)
+    os.environ["REASONING_EFFORT"] = settings.get("reasoning_effort", "medium")
+    os.environ["MAX_SEARCH_RESULTS_PER_QUERY"] = str(settings.get("max_search_results_per_query", 12))
+    os.environ["DEEP_RESEARCH_BREADTH"] = str(settings.get("deep_research_breadth", 3))
+    os.environ["DEEP_RESEARCH_DEPTH"] = str(settings.get("deep_research_depth", 2))
+    os.environ["DEEP_RESEARCH_CONCURRENCY"] = str(settings.get("deep_research_concurrency", 3))
+    os.environ["MAX_SCRAPER_WORKERS"] = str(settings.get("max_scraper_workers", 10))
+    os.environ["SCRAPER_RATE_LIMIT_DELAY"] = str(settings.get("scraper_rate_limit_delay", 0.1))
+    os.environ["BROWSE_CHUNK_MAX_LENGTH"] = str(settings.get("browse_chunk_max_length", 12000))
+    os.environ["SUMMARY_TOKEN_LIMIT"] = str(settings.get("summary_token_limit", 900))
+    os.environ["TOTAL_WORDS"] = str(settings.get("total_words", 1800))
+    os.environ["MAX_ITERATIONS"] = str(settings.get("max_iterations", 3))
+    os.environ["MAX_SUBTOPICS"] = str(settings.get("max_subtopics", 4))
+    os.environ["ARXIV_MAX_RESULTS"] = str(settings.get("arxiv_max_results", settings.get("max_search_results_per_query", 12)))
+    os.environ["ARXIV_PAGE_SIZE"] = str(settings.get("arxiv_page_size", 25))
+    os.environ["ARXIV_DELAY_SECONDS"] = str(settings.get("arxiv_delay_seconds", 4.0))
+    os.environ["ARXIV_NUM_RETRIES"] = str(settings.get("arxiv_num_retries", 4))
 
     embedding = settings.get("embedding_model", "").strip()
     if embedding:
@@ -505,8 +571,8 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
 def llm_complete(
     messages: list[dict[str, str]],
     settings: dict[str, Any],
-    temperature: float = 0.1,
-    max_tokens: int = 3000,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     configure_runtime_env(settings)
     if settings["backend"] == "Cloud API" and not settings.get("api_key", "").strip():
@@ -515,14 +581,21 @@ def llm_complete(
 
     from litellm import completion
 
+    effective_temperature = float(settings.get("llm_temperature", 0.2) if temperature is None else temperature)
+    effective_max_tokens = int(settings.get("llm_max_tokens", 5000) if max_tokens is None else max_tokens)
     kwargs: dict[str, Any] = {
         "model": litellm_model_name(settings),
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "temperature": effective_temperature,
+        "max_tokens": effective_max_tokens,
     }
+    top_p = float(settings.get("llm_top_p", 1.0))
+    if 0 < top_p < 1.0:
+        kwargs["top_p"] = top_p
     if settings["backend"] == "Local Ollama":
         kwargs["api_base"] = settings["ollama_base_url"].strip().rstrip("/")
+        for key, value in build_llm_kwargs(settings).items():
+            kwargs[key] = value
     elif settings["cloud_provider"] == "OpenAI":
         kwargs["api_key"] = settings.get("api_key", "").strip() or os.getenv("OPENAI_API_KEY")
         if settings.get("openai_base_url", "").strip():
@@ -659,6 +732,176 @@ def append_verified_sources(report: str, validated_sources: list[dict[str, Any]]
     return report.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
 
+def build_research_role_prompt() -> str:
+    skill_pack = load_agent_skill_pack(AGENT_SKILLS_DIR)
+    return (
+        f"You are a senior scientific research agent.\n\n{skill_pack}"
+        if skill_pack
+        else "You are a senior scientific research agent. Produce evidence-grounded research reports with citations."
+    )
+
+
+PLAN_HELP_TEXT = (
+    "Each row is one search direction. Query = the exact search string sent to retrievers; keep it concise, ideally "
+    "under 400 characters for Tavily. Goal = why the query exists and what evidence it should retrieve. "
+    "Bulk syntax, if you copy a plan elsewhere: query :: goal. Example: "
+    '"patent classification" "sustainable development goals" dataset :: Find datasets and label sources.'
+)
+
+
+def infer_plan_goal(query_text: str) -> str:
+    lower = query_text.lower()
+    if any(term in lower for term in ("dataset", "benchmark", "corpus")):
+        return "Find reusable datasets, benchmarks, labels, splits, and evaluation artifacts."
+    if any(term in lower for term in ("github", "code", "repository", "reproduc")):
+        return "Find reproducible implementations, code repositories, licenses, and released artifacts."
+    if any(term in lower for term in ("pdf", "peer", "journal", "transactions", "acm", "ieee", "springer", "elsevier")):
+        return "Find primary scholarly papers and accessible full-text sources."
+    if any(term in lower for term in ("weak supervision", "zero-shot", "llm", "bert", "transformer", "ontology")):
+        return "Find method papers and compare modeling approaches for the classification task."
+    return "Collect high-signal evidence relevant to the research question."
+
+
+def normalize_plan_items(plan_items: list[Any]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for item in plan_items:
+        if isinstance(item, dict):
+            query_text = str(item.get("query", "")).strip()
+            goal = str(item.get("researchGoal", "") or item.get("goal", "")).strip()
+        else:
+            query_text = str(item).strip()
+            goal = ""
+        if not query_text:
+            continue
+        normalized.append({"query": query_text, "researchGoal": goal or infer_plan_goal(query_text)})
+    return normalized
+
+
+def parse_plan_editor(text: str) -> list[dict[str, str]]:
+    planned: list[dict[str, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        if not line:
+            continue
+        if "::" in line:
+            query_text, goal = [part.strip() for part in line.split("::", 1)]
+        else:
+            query_text, goal = line, ""
+        if query_text:
+            planned.append({"query": query_text, "researchGoal": goal or infer_plan_goal(query_text)})
+    return planned
+
+
+def format_plan_for_editor(plan_items: list[Any]) -> str:
+    lines = []
+    for item in plan_items:
+        if isinstance(item, dict):
+            query_text = str(item.get("query", "")).strip()
+            goal = str(item.get("researchGoal", "")).strip()
+        else:
+            query_text = str(item).strip()
+            goal = ""
+        if not query_text:
+            continue
+        line = f"- {query_text}"
+        if goal:
+            line += f" :: {goal}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def clear_research_plan_state() -> None:
+    st.session_state["research_plan_text"] = ""
+    st.session_state["research_plan_editor"] = ""
+    st.session_state["research_plan_items"] = []
+    st.session_state["research_plan_source"] = {}
+
+
+def reset_plan_widget_keys() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(("plan_query_", "plan_goal_")):
+            del st.session_state[key]
+
+
+def set_research_plan_items(plan_items: list[Any], plan_key: dict[str, Any]) -> None:
+    normalized = normalize_plan_items(plan_items)
+    st.session_state["research_plan_items"] = normalized
+    st.session_state["research_plan_text"] = format_plan_for_editor(normalized)
+    st.session_state["research_plan_source"] = plan_key
+    reset_plan_widget_keys()
+
+
+def append_blank_plan_item() -> None:
+    items = list(st.session_state.get("research_plan_items", []))
+    items.append({"query": "", "researchGoal": ""})
+    st.session_state["research_plan_items"] = items
+
+
+def sync_plan_from_row_widgets() -> list[dict[str, str]]:
+    source_items = list(st.session_state.get("research_plan_items", []))
+    synced_all: list[dict[str, str]] = []
+    runnable: list[dict[str, str]] = []
+    for index, item in enumerate(source_items):
+        query_text = str(st.session_state.get(f"plan_query_{index}", item.get("query", ""))).strip()
+        goal = str(st.session_state.get(f"plan_goal_{index}", item.get("researchGoal", ""))).strip()
+        synced_all.append({"query": query_text, "researchGoal": goal or (infer_plan_goal(query_text) if query_text else "")})
+        if query_text:
+            runnable.append({"query": query_text, "researchGoal": goal or infer_plan_goal(query_text)})
+    st.session_state["research_plan_items"] = synced_all
+    st.session_state["research_plan_text"] = format_plan_for_editor(runnable)
+    return runnable
+
+
+def create_researcher(
+    query: str,
+    report_type: str,
+    settings: dict[str, Any],
+    log_handler: Any | None = None,
+    planned_queries: list[dict[str, str]] | None = None,
+):
+    from gpt_researcher import GPTResearcher
+
+    return GPTResearcher(
+        query=query,
+        report_type=report_type,
+        config_path=None,
+        headers={"retrievers": effective_retriever(settings)},
+        role=build_research_role_prompt(),
+        log_handler=log_handler,
+        preplanned_queries=planned_queries or [],
+    )
+
+
+async def generate_research_plan(
+    query: str,
+    report_type: str,
+    settings: dict[str, Any],
+    log_handler: Any | None = None,
+) -> list[dict[str, str]]:
+    require_runtime_modules(settings)
+    configure_runtime_env(settings)
+    if settings["backend"] == "Cloud API" and not settings.get("api_key", "").strip():
+        raise RuntimeError(f"Add a {settings['cloud_provider']} API key in the sidebar before planning research.")
+
+    researcher = create_researcher(query, report_type, settings, log_handler=log_handler)
+    if log_handler:
+        await log_handler.on_research_step("planning_search_strategy", {"query": query})
+    if report_type == "deep" and researcher.deep_researcher:
+        plan = await researcher.deep_researcher.generate_search_queries(
+            query,
+            num_queries=int(settings.get("deep_research_breadth", 3)),
+        )
+    else:
+        plan = await researcher.research_conductor.plan_research(query, researcher.query_domains)
+    normalized = parse_plan_editor(format_plan_for_editor(plan))
+    if not normalized:
+        normalized = [{"query": query, "researchGoal": "Fallback to the original user query."}]
+    return normalized
+
+
 def pdf_name_from_url(url: str, index: int) -> str:
     parsed = urlparse(url)
     name = Path(unquote(parsed.path)).name
@@ -705,28 +948,19 @@ async def run_gpt_researcher(
     settings: dict[str, Any],
     paths: RuntimePaths,
     log_handler: Any | None = None,
+    planned_queries: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     require_runtime_modules(settings)
     configure_runtime_env(settings)
     if settings["backend"] == "Cloud API" and not settings.get("api_key", "").strip():
         raise RuntimeError(f"Add a {settings['cloud_provider']} API key in the sidebar before running Deep Search.")
 
-    from gpt_researcher import GPTResearcher
-
-    safe_retriever = sanitize_retriever(settings["retriever"])
-    skill_pack = load_agent_skill_pack(AGENT_SKILLS_DIR)
-    role_prompt = (
-        f"You are a senior scientific research agent.\n\n{skill_pack}"
-        if skill_pack
-        else "You are a senior scientific research agent. Produce evidence-grounded research reports with citations."
-    )
-    researcher = GPTResearcher(
+    researcher = create_researcher(
         query=query,
         report_type=report_type,
-        config_path=None,
-        headers={"retrievers": safe_retriever},
-        role=role_prompt,
+        settings=settings,
         log_handler=log_handler,
+        planned_queries=planned_queries,
     )
     research_result = await researcher.conduct_research()
     report = await researcher.write_report()
@@ -743,7 +977,7 @@ async def run_gpt_researcher(
     urls = extract_urls(report, research_result, source_urls, research_sources)
     if log_handler:
         await log_handler.on_research_step("validating_sources", {"candidate_urls": len(urls)})
-    validated_sources = validate_source_urls(urls)
+    validated_sources = validate_source_urls(urls, limit=int(settings.get("source_validation_limit", 80)))
     if log_handler:
         await log_handler.on_research_step(
             "sources_validated", {"candidate_urls": len(urls), "verified_urls": len(validated_sources)}
@@ -757,7 +991,7 @@ async def run_gpt_researcher(
     pdf_urls = [source["url"] for source in validated_sources if looks_like_pdf_source(source)]
     if log_handler:
         await log_handler.on_research_step("downloading_pdfs", {"pdf_urls": len(pdf_urls)})
-    downloaded = download_pdf_urls(pdf_urls, paths.bib_pdf)
+    downloaded = download_pdf_urls(pdf_urls, paths.bib_pdf, limit=int(settings.get("pdf_download_limit", 15)))
     return {
         "report": report,
         "report_path": report_path,
@@ -1089,7 +1323,7 @@ def answer_workspace_question(
             ),
         },
     ]
-    return llm_complete(final_messages, settings, temperature=0.1, max_tokens=4200)
+    return llm_complete(final_messages, settings)
 
 
 def clean_latex_response(text: str) -> str:
@@ -1116,7 +1350,7 @@ def modify_latex_source(current_source: str, instruction: str, settings: dict[st
             "content": f"Instruction:\n{instruction}\n\nCurrent LaTeX source:\n{current_source}",
         },
     ]
-    return clean_latex_response(llm_complete(messages, settings, temperature=0.15, max_tokens=6000))
+    return clean_latex_response(llm_complete(messages, settings))
 
 
 def compile_latex(paths: RuntimePaths) -> dict[str, Any]:
@@ -1330,9 +1564,11 @@ with st.sidebar:
         active_model = st.text_input("Local model tag", value=DEFAULT_OLLAMA_MODEL)
 
     with st.expander("Discovery and indexing", expanded=False):
-        default_retriever = sanitize_retriever(os.getenv("RETRIEVER", "duckduckgo"))
+        default_retriever = sanitize_retriever(os.getenv("RETRIEVER", "duckduckgo,arxiv"))
         retrievers = ["duckduckgo", "arxiv", "semantic_scholar", "pubmed_central", "tavily", "searx", "bing", "exa"]
-        retriever = st.selectbox("Research retriever", retrievers, index=retrievers.index(default_retriever) if default_retriever in retrievers else 0)
+        default_retrievers = [item for item in default_retriever.split(",") if item in retrievers] or ["duckduckgo"]
+        selected_retrievers = st.multiselect("Research retrievers", retrievers, default=default_retrievers)
+        retriever = ",".join(selected_retrievers or ["duckduckgo"])
         tavily_api_key = st.text_input("Tavily API key", value=os.getenv("TAVILY_API_KEY", ""), type="password")
         default_embedding = (
             f"ollama:{DEFAULT_EMBEDDING_MODEL}"
@@ -1343,6 +1579,75 @@ with st.sidebar:
             "Research embedding model",
             value=os.getenv("EMBEDDING", default_embedding),
         )
+        max_search_results_per_query = st.number_input(
+            "Max results per query",
+            min_value=3,
+            max_value=100,
+            value=env_int("MAX_SEARCH_RESULTS_PER_QUERY", 12),
+            help="GPT Researcher default is 5. Raise this for broader discovery; reduce it when APIs rate-limit.",
+        )
+        source_validation_limit = st.number_input(
+            "Reachable source validation limit",
+            min_value=10,
+            max_value=250,
+            value=env_int("SOURCE_VALIDATION_LIMIT", 80),
+        )
+        pdf_download_limit = st.number_input(
+            "Verified PDF download limit",
+            min_value=0,
+            max_value=60,
+            value=env_int("PDF_DOWNLOAD_LIMIT", 15),
+        )
+        deep_research_breadth = st.number_input("Deep research breadth", min_value=1, max_value=8, value=env_int("DEEP_RESEARCH_BREADTH", 3))
+        deep_research_depth = st.number_input("Deep research depth", min_value=1, max_value=5, value=env_int("DEEP_RESEARCH_DEPTH", 2))
+        deep_research_concurrency = st.number_input(
+            "Deep research concurrency",
+            min_value=1,
+            max_value=8,
+            value=env_int("DEEP_RESEARCH_CONCURRENCY", 3),
+            help="Keep this modest when arXiv is enabled; arXiv itself is serialized to respect its API terms.",
+        )
+        max_scraper_workers = st.number_input("Max scraper workers", min_value=1, max_value=40, value=env_int("MAX_SCRAPER_WORKERS", 10))
+        scraper_rate_limit_delay = st.number_input(
+            "Scraper delay seconds",
+            min_value=0.0,
+            max_value=5.0,
+            step=0.1,
+            value=env_float("SCRAPER_RATE_LIMIT_DELAY", 0.1),
+        )
+        browse_chunk_max_length = st.number_input(
+            "Browse chunk max length",
+            min_value=2000,
+            max_value=50000,
+            step=1000,
+            value=env_int("BROWSE_CHUNK_MAX_LENGTH", 12000),
+        )
+        summary_token_limit = st.number_input(
+            "Summary token limit",
+            min_value=300,
+            max_value=4000,
+            step=100,
+            value=env_int("SUMMARY_TOKEN_LIMIT", 900),
+        )
+        total_words = st.number_input("Target report words", min_value=600, max_value=8000, step=100, value=env_int("TOTAL_WORDS", 1800))
+        max_iterations = st.number_input("Research iterations", min_value=1, max_value=8, value=env_int("MAX_ITERATIONS", 3))
+        max_subtopics = st.number_input("Max subtopics", min_value=1, max_value=10, value=env_int("MAX_SUBTOPICS", 4))
+        st.markdown("**arXiv API discipline**")
+        arxiv_max_results = st.number_input(
+            "arXiv max results per query",
+            min_value=3,
+            max_value=100,
+            value=env_int("ARXIV_MAX_RESULTS", min(25, int(max_search_results_per_query))),
+        )
+        arxiv_page_size = st.number_input("arXiv page size", min_value=3, max_value=100, value=env_int("ARXIV_PAGE_SIZE", 25))
+        arxiv_delay_seconds = st.number_input(
+            "arXiv delay seconds",
+            min_value=3.0,
+            max_value=30.0,
+            step=0.5,
+            value=max(3.0, env_float("ARXIV_DELAY_SECONDS", 4.0)),
+        )
+        arxiv_num_retries = st.number_input("arXiv retries", min_value=0, max_value=8, value=env_int("ARXIV_NUM_RETRIES", 4))
         pageindex_toc_pages = st.number_input("PageIndex ToC scan pages", min_value=1, max_value=80, value=int(os.getenv("PAGEINDEX_TOC_CHECK_PAGES", "20")))
         pageindex_max_pages_per_node = st.number_input(
             "Max pages per node", min_value=1, max_value=80, value=int(os.getenv("PAGEINDEX_MAX_PAGES_PER_NODE", "12"))
@@ -1354,6 +1659,35 @@ with st.sidebar:
             "Tree context char budget", min_value=8000, max_value=250000, step=1000, value=int(os.getenv("TREE_CONTEXT_CHAR_BUDGET", "45000"))
         )
         st.caption(f"Agent skills: {AGENT_SKILLS_DIR}")
+
+    with st.expander("LLM generation controls", expanded=False):
+        llm_temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=env_float("TEMPERATURE", 0.2), step=0.05)
+        llm_top_p = st.slider("Top-p", min_value=0.05, max_value=1.0, value=env_float("LLM_TOP_P", 0.9), step=0.05)
+        llm_max_tokens = st.number_input("Max output tokens", min_value=512, max_value=32000, step=256, value=env_int("LLM_MAX_TOKENS", 6000))
+        reasoning_effort = st.selectbox(
+            "Reasoning effort",
+            ["low", "medium", "high"],
+            index=["low", "medium", "high"].index(os.getenv("REASONING_EFFORT", "medium"))
+            if os.getenv("REASONING_EFFORT", "medium") in ["low", "medium", "high"]
+            else 1,
+        )
+        ollama_num_ctx = 0
+        ollama_top_k = 0
+        ollama_repeat_penalty = 0.0
+        ollama_num_predict = 0
+        if backend == "Local Ollama":
+            ollama_num_ctx = st.number_input("Ollama context window", min_value=2048, max_value=262144, step=1024, value=env_int("OLLAMA_NUM_CTX", 32768))
+            ollama_top_k = st.number_input("Ollama top-k", min_value=0, max_value=200, value=env_int("OLLAMA_TOP_K", 40))
+            ollama_repeat_penalty = st.number_input(
+                "Ollama repeat penalty",
+                min_value=0.0,
+                max_value=2.0,
+                step=0.05,
+                value=env_float("OLLAMA_REPEAT_PENALTY", 1.1),
+            )
+            ollama_num_predict = st.number_input("Ollama num_predict", min_value=0, max_value=32000, step=256, value=env_int("OLLAMA_NUM_PREDICT", 6000))
+        else:
+            st.caption("OpenAI-compatible cloud calls use temperature, top-p, max tokens, and reasoning effort where the model supports them.")
 
     with st.expander("Workspace paths", expanded=False):
         bib_pdf_raw = st.text_input("PDF staging directory", value=os.getenv("BIB_PDF_DIR", "./bib_pdf"))
@@ -1371,6 +1705,31 @@ settings = {
     "retriever": sanitize_retriever(retriever),
     "tavily_api_key": tavily_api_key,
     "embedding_model": embedding_model,
+    "llm_temperature": float(llm_temperature),
+    "llm_top_p": float(llm_top_p),
+    "llm_max_tokens": int(llm_max_tokens),
+    "reasoning_effort": reasoning_effort,
+    "ollama_num_ctx": int(ollama_num_ctx),
+    "ollama_top_k": int(ollama_top_k),
+    "ollama_repeat_penalty": float(ollama_repeat_penalty),
+    "ollama_num_predict": int(ollama_num_predict),
+    "max_search_results_per_query": int(max_search_results_per_query),
+    "source_validation_limit": int(source_validation_limit),
+    "pdf_download_limit": int(pdf_download_limit),
+    "deep_research_breadth": int(deep_research_breadth),
+    "deep_research_depth": int(deep_research_depth),
+    "deep_research_concurrency": int(deep_research_concurrency),
+    "max_scraper_workers": int(max_scraper_workers),
+    "scraper_rate_limit_delay": float(scraper_rate_limit_delay),
+    "browse_chunk_max_length": int(browse_chunk_max_length),
+    "summary_token_limit": int(summary_token_limit),
+    "total_words": int(total_words),
+    "max_iterations": int(max_iterations),
+    "max_subtopics": int(max_subtopics),
+    "arxiv_max_results": int(arxiv_max_results),
+    "arxiv_page_size": int(arxiv_page_size),
+    "arxiv_delay_seconds": float(arxiv_delay_seconds),
+    "arxiv_num_retries": int(arxiv_num_retries),
     "language": os.getenv("LANGUAGE", "english"),
     "curate_sources": os.getenv("CURATE_SOURCES", "true").lower() == "true",
     "pageindex_toc_pages": int(pageindex_toc_pages),
@@ -1391,7 +1750,7 @@ missing_modules = missing_runtime_modules(settings)
 
 st.title(workspace_title)
 st.caption(f"Active model: {settings['backend']} / {settings['model']} | Paper: {paths.paper_tex.relative_to(ROOT) if paths.paper_tex.is_relative_to(ROOT) else paths.paper_tex}")
-st.caption(f"Engines: GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | PageIndex `{PAGEINDEX_ENGINE_PATH}` | Retriever `{settings['retriever']}`")
+st.caption(f"Engines: GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | PageIndex `{PAGEINDEX_ENGINE_PATH}` | Retriever `{effective_retriever(settings)}`")
 if created_paper:
     safe_toast(f"Initialized {paths.paper_tex.name}")
 if missing_modules:
@@ -1410,6 +1769,14 @@ with tab_search:
     left, right = st.columns([0.95, 1.05], gap="large")
     if "selected_report_path" not in st.session_state:
         st.session_state["selected_report_path"] = ""
+    if "research_plan_text" not in st.session_state:
+        st.session_state["research_plan_text"] = ""
+    if "research_plan_editor" not in st.session_state:
+        st.session_state["research_plan_editor"] = ""
+    if "research_plan_items" not in st.session_state:
+        st.session_state["research_plan_items"] = []
+    if "research_plan_source" not in st.session_state:
+        st.session_state["research_plan_source"] = {}
     with left:
         st.subheader("Agentic Discovery")
         default_query = (
@@ -1424,36 +1791,32 @@ with tab_search:
             if os.getenv("GPT_RESEARCHER_REPORT_TYPE", "research_report") in ["research_report", "detailed_report", "deep", "custom_report"]
             else 0,
         )
-        if st.button("Execute Deep Literature Search", type="primary", width="stretch"):
+        plan_key = {
+            "query": query.strip(),
+            "report_type": report_type,
+            "retriever": effective_retriever(settings),
+            "max_results": settings["max_search_results_per_query"],
+            "breadth": settings["deep_research_breadth"],
+        }
+        if st.button("Generate Research Plan", type="primary", width="stretch"):
             if not query.strip():
-                st.warning("Enter a query before launching the researcher.")
+                st.warning("Enter a query before planning the researcher.")
             else:
                 progress_box = st.empty()
                 capture = None
                 handler = StreamlitResearchLogHandler(progress_box=progress_box)
                 try:
-                    handler._stage("Preparing Deep Search", "Initializing model, retriever, and scientific search skills.")
+                    handler._stage("Preparing planner", "Initializing model, retriever, and scientific search skills.")
                     capture = StreamlitLoggingCaptureHandler(handler)
                     logging.getLogger("research").addHandler(capture)
                     logging.getLogger("gpt_researcher").addHandler(capture)
-                    result = run_async(run_gpt_researcher(query.strip(), report_type, settings, paths, log_handler=handler))
+                    plan_items = run_async(generate_research_plan(query.strip(), report_type, settings, log_handler=handler))
                     if capture:
                         logging.getLogger("research").removeHandler(capture)
                         logging.getLogger("gpt_researcher").removeHandler(capture)
-                    handler._stage("Saving report and acquired PDFs", "Writing markdown report and downloading discovered PDFs when available.")
-                    handler._finish("Deep Search complete", f"Saved report: {Path(result['report_path']).name}")
-                    safe_toast("Deep literature search complete")
-                    st.success(f"Report saved to {result['report_path']}")
-                    st.session_state["selected_report_path"] = str(result["report_path"])
-                    st.session_state["last_deep_search_report"] = result.get("report", "")
-                    st.write(f"Discovered URLs scanned for PDFs: {result['url_count']}")
-                    st.write(f"Verified reachable source links: {result['verified_url_count']}")
-                    if result["downloaded"]:
-                        st.write("Downloaded PDFs")
-                        st.dataframe(
-                            [{"file": path.name, "path": str(path)} for path in result["downloaded"]],
-                            width="stretch",
-                        )
+                    set_research_plan_items(plan_items, plan_key)
+                    handler._finish("Research plan ready", f"{len(plan_items)} planned search directions.")
+                    safe_toast("Research plan generated")
                 except Exception as exc:
                     try:
                         if capture:
@@ -1462,8 +1825,93 @@ with tab_search:
                     except Exception:
                         pass
                     handler._fail(str(exc)[:180])
-                    st.error("Deep Search failed.")
+                    st.error("Research planning failed.")
                     st.code(str(exc), language="text")
+
+        if st.session_state.get("research_plan_items"):
+            if st.session_state.get("research_plan_source") != plan_key:
+                st.warning("This plan was generated for different query/settings. Regenerate it or review edits carefully.")
+            title_cols = st.columns([0.88, 0.12])
+            title_cols[0].markdown("#### Planned Research Queries")
+            title_cols[1].button("i", help=PLAN_HELP_TEXT, width="stretch")
+            st.caption("Edit rows directly. Changes are applied when a field loses focus or the page reruns.")
+
+            for index, item in enumerate(st.session_state.get("research_plan_items", [])):
+                query_key = f"plan_query_{index}"
+                goal_key = f"plan_goal_{index}"
+                if query_key not in st.session_state:
+                    st.session_state[query_key] = item.get("query", "")
+                if goal_key not in st.session_state:
+                    st.session_state[goal_key] = item.get("researchGoal", "") or infer_plan_goal(item.get("query", ""))
+                with st.container(border=True):
+                    st.markdown(f"**Search direction {index + 1}**")
+                    st.text_input(
+                        "Query",
+                        key=query_key,
+                        placeholder='"patent classification" "sustainable development goals" dataset',
+                        help="Exact retriever query. Keep concise; Tavily rejects queries over 400 characters.",
+                    )
+                    st.text_input(
+                        "Goal",
+                        key=goal_key,
+                        placeholder="Find datasets, benchmarks, or primary papers for this query.",
+                        help="Purpose of this query. If left blank, the app fills a sensible default from the query terms.",
+                    )
+            planned_queries = sync_plan_from_row_widgets()
+            run_col, clear_col = st.columns([0.72, 0.28])
+            with run_col:
+                if st.button("Start Research with Approved Plan", type="primary", width="stretch"):
+                    if not planned_queries:
+                        st.warning("Keep at least one planned query before starting research.")
+                    else:
+                        progress_box = st.empty()
+                        capture = None
+                        handler = StreamlitResearchLogHandler(progress_box=progress_box)
+                        try:
+                            handler._stage("Preparing Deep Search", "Starting from the user-approved research plan.")
+                            capture = StreamlitLoggingCaptureHandler(handler)
+                            logging.getLogger("research").addHandler(capture)
+                            logging.getLogger("gpt_researcher").addHandler(capture)
+                            result = run_async(
+                                run_gpt_researcher(
+                                    query.strip(),
+                                    report_type,
+                                    settings,
+                                    paths,
+                                    log_handler=handler,
+                                    planned_queries=planned_queries,
+                                )
+                            )
+                            if capture:
+                                logging.getLogger("research").removeHandler(capture)
+                                logging.getLogger("gpt_researcher").removeHandler(capture)
+                            handler._stage("Saving report and acquired PDFs", "Writing markdown report and downloading discovered PDFs when available.")
+                            handler._finish("Deep Search complete", f"Saved report: {Path(result['report_path']).name}")
+                            safe_toast("Deep literature search complete")
+                            st.success(f"Report saved to {result['report_path']}")
+                            st.session_state["selected_report_path"] = str(result["report_path"])
+                            st.session_state["last_deep_search_report"] = result.get("report", "")
+                            st.write(f"Discovered URLs scanned for PDFs: {result['url_count']}")
+                            st.write(f"Verified reachable source links: {result['verified_url_count']}")
+                            if result["downloaded"]:
+                                st.write("Downloaded PDFs")
+                                st.dataframe(
+                                    [{"file": path.name, "path": str(path)} for path in result["downloaded"]],
+                                    width="stretch",
+                                )
+                        except Exception as exc:
+                            try:
+                                if capture:
+                                    logging.getLogger("research").removeHandler(capture)
+                                    logging.getLogger("gpt_researcher").removeHandler(capture)
+                            except Exception:
+                                pass
+                            handler._fail(str(exc)[:180])
+                            st.error("Deep Search failed.")
+                            st.code(str(exc), language="text")
+            with clear_col:
+                st.button("Clear Plan", width="stretch", on_click=clear_research_plan_state)
+            st.button("Add Query Row", width="stretch", on_click=append_blank_plan_item)
 
     with right:
         st.subheader("Structural Staging Room")
