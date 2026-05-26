@@ -1,4 +1,6 @@
 .env.local
+.env
+.env.*
 *.aux
 *.bbl
 *.bcf
@@ -9,11 +11,18 @@
 *.out
 *.run.xml
 *.synctex.gz
+*.pdf
 compiled_output/
 pageindex_cache/
+results/
 __pycache__/
 .streamlit/secrets.toml
-logs/*.json
-results/
-Screenshot *.png
+logs/
+bib_pdf/
+*.Zone.Identifier
+Screenshot*.png
 today.png
+__pycache__/
+.ipynb_checkpoints/
+.codex/
+.agents/
