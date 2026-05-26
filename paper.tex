@@ -7,119 +7,25 @@
 \usepackage{hyperref}
 \usepackage{enumitem}
 
-\title{Patent Classification into SDGs: A Frugal, Interpretable Approach}
-\author{Research Copilot Workspace}
+\title{DeepSciPaper Workspace}
+\author{Research Copilot}
 \date{\today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This paper presents a novel methodology for classifying patents according to the Sustainable Development Goals (SDGs). Our approach leverages transfer learning from scientific abstracts (OSDG)\cite{sdg_transfer_learning_example}, implemented through an annotation strategy applied to a target dataset of patents, and validated by the creation of a synthetic dataset including a critical ``Non-SDG'' class. Unlike ``black box'' large language models (LLMs), our architecture employs a logical chain of specialized, smaller models (e.g., BERT), orchestrated by explicit business rules. This resource-efficient approach achieves inference speeds 50 times faster than LLMs, enhanced interpretability, and superior accuracy on standard benchmarks.
+This is a bootstrap LaTeX manuscript for the DeepSciPaper Research Copilot. The Streamlit app will keep the source synchronized and can compile it locally via \texttt{pdflatex}.
 \end{abstract}
 
-\section{Introduction}
-The alignment of technological innovation with global sustainability goals is increasingly critical. Patents, as indicators of technological advancement, offer a valuable lens through which to assess progress towards the Sustainable Development Goals (SDGs) adopted by the United Nations in 2015. Classifying patents according to their contribution to specific SDGs is a challenging task, requiring sophisticated natural language processing (NLP) techniques to extract relevant information from complex technical documents.
+\section{Research Aim}
+Replace this text with the specific research aim for your workspace.
 
-Existing approaches often rely on large language models (LLMs), which, while powerful, suffer from limitations in terms of computational cost, interpretability, and potential biases. This paper introduces a novel, frugal, and interpretable approach to patent classification into SDGs, addressing these limitations while maintaining high accuracy.
+\section{Evidence Base}
+Primary PDFs are staged under \texttt{bib\_pdf/}. PageIndex semantic trees are cached under \texttt{pageindex\_cache/}.
 
-\section{Related Work and State of the Art}
-Early work on SDG classification relied on keyword matching and rule-based heuristics \cite{sdg_keyword_example}. These methods are fast but fail to capture the nuanced semantics of patent texts. More recent efforts have employed supervised machine learning, training classifiers on manually annotated datasets \cite{sdg_supervised_example}. However, the creation of such datasets is time-consuming and expensive.
-
-Transfer learning from related domains, such as scientific literature, has emerged as a promising alternative \cite{sdg_transfer_learning_example}. Large language models (LLMs) have also been applied to this task, demonstrating impressive results \cite{sdg_llm_example}. Their size and complexity, however, make them computationally expensive and difficult to interpret.
-
-Our work builds upon these approaches by combining transfer learning with a modular, rule-based architecture, offering a balance between accuracy, efficiency, and interpretability. Specifically, we differentiate ourselves from \cite{sdg_llm_example} by eschewing the ``black box'' nature of LLMs in favor of a more transparent and controllable system.
-
-\section{Methodology}
-Our methodology comprises three key stages:
-
-\subsection{Transfer Learning from Scientific Abstracts}
-We employ a BERT-based model pre-trained on the OSDG dataset \cite{sdg_transfer_learning_example}, which contains scientific abstracts annotated with SDG labels. The transfer learning process involves two main steps:
-1) Domain adaptation through fine-tuning on patent-specific language features
-2) Task-specific adaptation for patent classification
-
-The initial BERT weights from OSDG are fine-tuned using our patent dataset with a learning rate of 2e-5 and batch size of 32. We implement layer-wise learning rate decay to prevent catastrophic forgetting of the scientific domain knowledge while adapting to patents.
-
-\subsection{Annotation and Dataset Creation}
-Our annotation process combines automated pre-labeling with human verification. For the synthetic "Non-SDG" class, we sampled patents from domains known to be unrelated to SDGs (e.g., certain types of mechanical inventions) and augmented them with adversarial examples to challenge our classifier.
-
-We achieved a Cohen's kappa of 0.82 between annotators for the SDG classes, demonstrating reliable labeling. The final dataset contains 10\% "Non-SDG" patents to ensure robust classification of irrelevant cases.
-
-\subsection{Modular Architecture and Validation}
-Our architecture consists of three BERT-based modules working in sequence:
-
-1) \textbf{Domain Classifier}: Identifies whether a patent falls within SDG-relevant domains
-2) \textbf{Relevance Scorer}: Assesses how strongly the patent relates to any SDG
-3) \textbf{SDG Classifier}: Performs fine-grained classification into specific SDGs
-
-Business rules govern the flow between modules. For example, if the domain classifier outputs low confidence, additional context is gathered before proceeding. This modularity allows us to update individual components without retraining the entire system.
-
-Validation was performed through 5-fold cross-validation on our annotated dataset and comparison against LLM baselines using held-out test sets.
-
-\section{Experimental Setup}
-The experiments were conducted on a dataset of 10,000 patents obtained from the European Patent Office's Espacenet database \cite{espacenet}, covering a range of technological domains. The dataset was split into 70\% training, 15\% validation, and 15\% test sets.
-
-Text preprocessing included normalization of technical terms, removal of boilerplate text (e.g., patent claims sections), and special handling for chemical formulas and mathematical expressions. We implemented our pipeline using PyTorch 1.9.0 with HuggingFace's Transformers library \cite{wolf2019huggingface}. Experiments were conducted on an NVIDIA V100 GPU with 32GB RAM.
-
-We compared our approach against the baseline LLM model GPT-3.5 Turbo using precision, recall, and macro-averaged F1-score as evaluation metrics. The computational cost of inference was measured in terms of average inference time per patent (seconds).
-
-\section{Results}
-Our approach achieved a macro-averaged F1-score of 0.78 on the test set, outperforming the baseline LLM model by 12\%. Furthermore, our method exhibited an inference speed 50 times faster than the LLM baseline. The modular architecture also facilitated greater interpretability, allowing us to identify the key features driving the classification decisions.
-
-A detailed breakdown of per-class performance is shown in Table~\ref{tab:perclass}, while overall metrics are presented in Table~\ref{tab:results}.
-
-\begin{table}[h!]
-\centering
-\caption{Classification Results}
-\begin{tabular}{lcc}
-\toprule
-Model & F1-Score & Inference Time (s/patent) \\
-\midrule
-Our Approach & 0.78 & 0.12 \\
-Baseline LLM & 0.69 & 6.00 \\
-\bottomrule
-\end{tabular}
-\label{tab:results}
-\end{table}
-
-\begin{table}[h!]
-\centering
-\caption{Per-Class F1-Scores}
-\begin{tabular}{lcc}
-\toprule
-SDG Class & Our Approach & Baseline LLM \\
-\midrule
-SDG 1 (No Poverty) & 0.82 & 0.75 \\
-SDG 2 (Zero Hunger) & 0.79 & 0.70 \\
-... & ... & ... \\
-Non-SDG & 0.85 & 0.65 \\
-\bottomrule
-\end{tabular}
-\label{tab:perclass}
-\end{table}
-
-\section{Discussion}
-The results demonstrate the effectiveness of our frugal and interpretable approach to patent classification into SDGs. The transfer learning strategy significantly reduced the need for labeled data, while the modular architecture provided greater control and transparency.
-
-Our approach's superior inference speed compared to LLMs makes it more practical for large-scale patent analysis. The ability to identify the key features driving the classification decisions enhances trust and facilitates further refinement of the model.
-
-Future work will focus on extending our approach to handle multilingual patents by incorporating language detection and translation modules into our pipeline. Additionally, we will explore active learning approaches to further reduce the annotation burden for new domains.
-
-\section{Conclusion}
-We have presented a novel methodology for classifying patents according to the SDGs, combining transfer learning, annotation, and a modular architecture. Our approach offers a compelling alternative to LLM-based methods, providing a balance between accuracy, efficiency, and interpretability.
-
-This work contributes to the growing body of research on SDG alignment and provides a valuable tool for policymakers and investors seeking to promote sustainable innovation.
-
-\section*{Acknowledgements}
-We thank the members of the Sustainable Innovation Lab for their insightful discussions and the anonymous reviewers for their constructive feedback.
-
-\begin{thebibliography}{9}
-\bibitem{sdg_keyword_example} J. Doe, ``Keyword-Based SDG Classification of Text,'' \emph{Journal of Sustainable Computing}, vol. 12, no. 3, pp. 45–58, 2020.
-\bibitem{sdg_supervised_example} A. Smith and B. Lee, ``Supervised Learning for SDG Annotation of Scientific Articles,'' \emph{Proceedings of the NLP Conference}, 2019, pp. 112–120.
-\bibitem{sdg_transfer_learning_example} C. Zhang et al., ``Transfer Learning from Scientific Abstracts for SDG Classification,'' \emph{IEEE Transactions on Knowledge and Data Engineering}, vol. 33, no. 7, pp. 2345–2358, 2021.
-\bibitem{sdg_llm_example} M. Patel and R. Gupta, ``Large Language Models for Sustainable Development Goal Detection,'' \emph{Artificial Intelligence Review}, vol. 45, no. 2, pp. 987–1003, 2022.
-\bibitem{espacenet} European Patent Office, ``Espacenet: Patents Database,'' \url{https://worldwide.espacenet.com/}, accessed 2026-05-21.
-\bibitem{wolf2019huggingface} T. Wolf et al., ``HuggingFace's Transformers: State-of-the-art Natural Language Processing,'' 2019, \url{https://github.com/huggingface/transformers}.
-\end{thebibliography}
+\section{Draft Synthesis}
+Start writing here. When possible, cite with page/section references derived from PageIndex.
 
 \end{document}
+
