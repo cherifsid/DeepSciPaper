@@ -27,23 +27,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PAGEINDEX_LOGGER = logging.getLogger("research_copilot.pageindex")
-if not PAGEINDEX_LOGGER.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-    PAGEINDEX_LOGGER.addHandler(_handler)
-PAGEINDEX_LOGGER.setLevel(logging.INFO)
-PAGEINDEX_LOGGER.propagate = False
-
 ROOT = Path(__file__).resolve().parent
 GPT_RESEARCHER_ENGINE_PATH = (ROOT / os.getenv("GPT_RESEARCHER_ENGINE_PATH", "./engines/gpt-researcher")).resolve()
-PAGEINDEX_ENGINE_PATH = (ROOT / os.getenv("PAGEINDEX_ENGINE_PATH", "./engines/PageIndex")).resolve()
 AGENT_SKILLS_DIR = (ROOT / os.getenv("AGENT_SKILLS_DIR", "./agents/skills")).resolve()
 
 
 def activate_local_engine_paths() -> None:
     engine_specs = [
-        (PAGEINDEX_ENGINE_PATH, "pageindex"),
         (GPT_RESEARCHER_ENGINE_PATH, "gpt_researcher"),
     ]
     for engine_path, package_dir in engine_specs:
@@ -59,6 +49,7 @@ DEFAULT_TITLE = os.getenv("WORKSPACE_TITLE", "Patent Classification into SDGs")
 DEFAULT_OLLAMA_MODEL = os.getenv("DEFAULT_MODEL", "qwen2.5:72b-instruct")
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_EMBEDDING_MODEL = os.getenv("DEFAULT_EMBEDDING_MODEL", "bge-m3:567m")
+FIXED_MULTIMODAL_EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
 DEFAULT_CLOUD_MODEL = os.getenv("DEFAULT_CLOUD_MODEL", "gpt-4o")
 DEFAULT_DEEPSEEK_MODEL = os.getenv("DEFAULT_DEEPSEEK_MODEL", "deepseek-chat")
 GOOGLE_RETRIEVERS = {"google", "searchapi", "serper", "serpapi"}
@@ -309,7 +300,6 @@ class StreamlitLoggingCaptureHandler(logging.Handler):
 @dataclass(frozen=True)
 class RuntimePaths:
     bib_pdf: Path
-    pageindex_cache: Path
     compiled_output: Path
     paper_tex: Path
 
@@ -345,14 +335,6 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
-
-
-def latest_pageindex_log_path(pdf_name: str) -> str:
-    logs_dir = ROOT / "logs"
-    if not logs_dir.exists():
-        return ""
-    candidates = sorted(logs_dir.glob(f"{pdf_name}_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return str(candidates[0]) if candidates else ""
 
 
 LATEX_ESCAPE = {
@@ -393,17 +375,17 @@ def latex_template(workspace_title: str) -> str:
 \maketitle
 
 \begin{{abstract}}
-This living manuscript captures a reproducible research synthesis for the workspace titled ``{latex_escape(title_for_text)}.'' The document is designed to be edited continuously as new literature is discovered, structurally indexed, and cross-examined through the local Research Copilot environment.
+This living manuscript captures a reproducible research synthesis for the workspace titled ``{latex_escape(title_for_text)}.'' The document is designed to be edited continuously as new literature is discovered, parsed into multimodal artifacts, and cross-examined through the local Research Copilot environment.
 \end{{abstract}}
 
 \section{{Research Aim}}
 The project investigates methods, evidence, and evaluation protocols for {latex_escape(workspace_title.lower())}. The manuscript should preserve traceable claims, clearly separate empirical findings from interpretation, and cite supporting sources as the workspace evidence base grows.
 
 \section{{Evidence Base}}
-The evidence base is maintained outside this manuscript in the workspace directories. Primary literature PDFs are staged in \texttt{{bib\_pdf/}}, semantic PageIndex trees are cached in \texttt{{pageindex\_cache/}}, and compiled artifacts are written to \texttt{{compiled\_output/}}.
+The evidence base is maintained outside this manuscript in the workspace directories. Primary literature PDFs are staged in \texttt{{bib\_pdf/}}, multimodal MinerU artifacts and local Qdrant indexes are stored in \texttt{{multimodal\_store/}}, and compiled artifacts are written to \texttt{{compiled\_output/}}.
 
 \section{{Methodological Notes}}
-The intended retrieval path is vectorless. Documents are transformed into semantic section trees with stable node identifiers and page ranges. The co-authoring workflow should use those structural references to ground synthesis, comparisons, and claims.
+The intended retrieval path is agentic and multimodal. Documents are parsed into Markdown, raw JSON, tables, figures, captions, and local embedding records. The co-authoring workflow should use those artifact references to ground synthesis, comparisons, and claims.
 
 \section{{Draft Synthesis}}
 This section is the active synthesis area. As the workspace accumulates indexed primary literature, revise claims with section-level and page-level evidence references.
@@ -425,7 +407,6 @@ This document is ready for iterative AI-assisted editing and local compilation.
 
 def ensure_bootstrap_files(paths: RuntimePaths, workspace_title: str) -> bool:
     paths.bib_pdf.mkdir(parents=True, exist_ok=True)
-    paths.pageindex_cache.mkdir(parents=True, exist_ok=True)
     paths.compiled_output.mkdir(parents=True, exist_ok=True)
 
     created_paper = False
@@ -531,55 +512,11 @@ def gpt_researcher_model_name(settings: dict[str, Any]) -> str:
     return f"openai:{strip_provider_prefix(raw_model, 'openai')}"
 
 
-def pageindex_model_name(settings: dict[str, Any]) -> str:
-    raw_model = settings["model"].strip()
-    if settings["backend"] == "Local Ollama":
-        return f"ollama/{strip_provider_prefix(raw_model, 'ollama')}"
-    if settings["cloud_provider"] == "DeepSeek":
-        return f"deepseek/{strip_provider_prefix(raw_model, 'deepseek')}"
-    return strip_provider_prefix(raw_model, "openai")
-
-
 def strip_ollama_tag(model: str) -> str:
     model = strip_provider_prefix(model.strip(), "ollama")
     if model.startswith("ollama/"):
         return model.split("/", 1)[1]
     return model
-
-
-def preflight_pageindex_backend(settings: dict[str, Any]) -> None:
-    if settings["backend"] == "Cloud API":
-        if not settings.get("api_key", "").strip():
-            raise RuntimeError(f"Missing {settings['cloud_provider']} API key for PageIndex indexing.")
-        return
-
-    import requests
-
-    base_url = settings.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
-    model_tag = strip_ollama_tag(settings.get("model", ""))
-    if not model_tag:
-        raise RuntimeError("No Ollama model tag provided for PageIndex indexing.")
-
-    PAGEINDEX_LOGGER.info("PageIndex preflight: probing Ollama endpoint %s", base_url)
-    try:
-        response = requests.get(f"{base_url}/api/tags", timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Ollama preflight failed at {base_url}. Ensure Ollama is running and reachable before indexing."
-        ) from exc
-
-    models = [str(item.get("name", "")).strip() for item in payload.get("models", []) if item.get("name")]
-    aliases = {name for name in models}
-    aliases.update({name.split(":", 1)[0] for name in models if ":" in name})
-    if model_tag not in aliases:
-        raise RuntimeError(
-            f"Ollama model `{model_tag}` is not installed. Available: {', '.join(models[:12]) or '(none)'}."
-        )
-
-    os.environ["OLLAMA_BASE_URL"] = base_url
-    os.environ["OLLAMA_API_BASE"] = base_url
 
 
 def configure_runtime_env(settings: dict[str, Any]) -> None:
@@ -613,11 +550,6 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
     os.environ["ARXIV_PAGE_SIZE"] = str(settings.get("arxiv_page_size", 25))
     os.environ["ARXIV_DELAY_SECONDS"] = str(settings.get("arxiv_delay_seconds", 4.0))
     os.environ["ARXIV_NUM_RETRIES"] = str(settings.get("arxiv_num_retries", 4))
-    os.environ["PAGEINDEX_LLM_TIMEOUT_SECONDS"] = str(settings.get("pageindex_llm_timeout_seconds", 180))
-    os.environ["PAGEINDEX_LLM_MAX_RETRIES"] = str(settings.get("pageindex_llm_max_retries", 3))
-    os.environ["PAGEINDEX_TEMPERATURE"] = str(settings.get("pageindex_temperature", 0.0))
-    os.environ["PAGEINDEX_TOP_P"] = str(settings.get("pageindex_top_p", 1.0))
-
     embedding = settings.get("embedding_model", "").strip()
     if embedding:
         os.environ["EMBEDDING"] = embedding
@@ -630,11 +562,6 @@ def configure_runtime_env(settings: dict[str, Any]) -> None:
         base_url = settings["ollama_base_url"].strip().rstrip("/")
         os.environ["OLLAMA_BASE_URL"] = base_url
         os.environ["OLLAMA_API_BASE"] = base_url
-        os.environ["PAGEINDEX_OLLAMA_API_BASE"] = base_url
-        os.environ["PAGEINDEX_OLLAMA_NUM_CTX"] = str(settings.get("ollama_num_ctx", 0))
-        os.environ["PAGEINDEX_OLLAMA_TOP_K"] = str(settings.get("ollama_top_k", 0))
-        os.environ["PAGEINDEX_OLLAMA_REPEAT_PENALTY"] = str(settings.get("ollama_repeat_penalty", 0.0))
-        os.environ["PAGEINDEX_OLLAMA_NUM_PREDICT"] = str(settings.get("ollama_num_predict", 0))
         if embedding and embedding.startswith("ollama:"):
             os.environ["EMBEDDING"] = embedding
     elif settings["cloud_provider"] == "DeepSeek":
@@ -759,6 +686,13 @@ def llm_complete(
         "max_tokens": effective_max_tokens,
         "timeout": timeout_seconds,
     }
+    model_name = settings.get("model", "").strip().lower()
+    supports_reasoning_effort = any(
+        token in model_name
+        for token in ("gpt-5", "o1", "o3", "o4")
+    )
+    if settings.get("backend") == "Cloud API" and settings.get("cloud_provider") == "OpenAI" and supports_reasoning_effort:
+        kwargs["reasoning_effort"] = settings.get("reasoning_effort", "medium")
     top_p = float(settings.get("llm_top_p", 1.0))
     if 0 < top_p < 1.0:
         kwargs["top_p"] = top_p
@@ -811,6 +745,16 @@ def llm_complete(
                     break
 
     if litellm_error:
+        error_text = str(litellm_error)
+        if "reasoning_effort" in kwargs and ("unexpected keyword" in error_text.lower() or "unsupported" in error_text.lower()):
+            kwargs.pop("reasoning_effort", None)
+            try:
+                response = completion(**kwargs)
+                text = extract_llm_response_text(response)
+                if text:
+                    return text
+            except Exception as retry_exc:
+                litellm_error = retry_exc
         raise RuntimeError(str(litellm_error)) from litellm_error
     raise RuntimeError("Model returned an empty completion.")
 
@@ -819,6 +763,117 @@ def discover_pdfs(bib_pdf_dir: Path) -> list[Path]:
     if not bib_pdf_dir.exists():
         return []
     return sorted(path for path in bib_pdf_dir.glob("*.pdf") if path.is_file())
+
+
+def summarize_multimodal_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for item in results:
+        rows.append(
+            {
+                "status": item.get("status"),
+                "pdf": Path(item.get("source_pdf", "")).name,
+                "parser": item.get("parser", ""),
+                "chunks": item.get("text_chunks", 0),
+                "tables": item.get("tables", 0),
+                "images": item.get("images", 0),
+                "vectors": item.get("vector_records", 0),
+                "error": item.get("error", ""),
+            }
+        )
+    return rows
+
+
+def render_artifacts(artifact_references: list[dict[str, Any]]) -> None:
+    if not artifact_references:
+        return
+    with st.expander("Image and table artifacts", expanded=False):
+        st.dataframe(artifact_references, width="stretch", hide_index=True)
+        image_refs = [item for item in artifact_references if item.get("modality") == "image" and item.get("asset_path")]
+        if image_refs:
+            image_cols = st.columns(2)
+            for index, item in enumerate(image_refs[:8]):
+                path = Path(str(item.get("asset_path", "")))
+                if path.exists():
+                    image_cols[index % 2].image(
+                        str(path),
+                        caption=f"{item.get('source_pdf_name', '')} | {item.get('title', '')}",
+                        width="stretch",
+                    )
+
+
+def build_multimodal_evidence_bundle(evidence: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    evidence_lines: list[str] = []
+    evidence_references: list[dict[str, Any]] = []
+    for index, item in enumerate(evidence, start=1):
+        score_value = item.get("score", 0.0)
+        try:
+            score = f"{float(score_value):.3f}"
+        except Exception:
+            score = str(score_value)
+        evidence_lines.append(
+            (
+                f"[E{index}] modality={item.get('modality')} score={score} "
+                f"source={item.get('source_pdf_name')} section={item.get('section_title', '')} "
+                f"title={item.get('title')} asset={item.get('asset_path')}\n"
+                f"{item.get('display_text', '')}"
+            ).strip()
+        )
+        evidence_references.append(
+            {
+                "index": index,
+                "modality": item.get("modality"),
+                "source_pdf_name": item.get("source_pdf_name"),
+                "section_title": item.get("section_title", ""),
+                "asset_path": item.get("asset_path"),
+                "score": item.get("score"),
+                "title": item.get("title"),
+            }
+        )
+    artifact_references = [row for row in evidence_references if row.get("modality") in {"table", "image"}]
+    return "\n\n".join(evidence_lines), evidence_references, artifact_references
+
+
+def multimodal_chat_answer(
+    question: str,
+    settings: dict[str, Any],
+    multimodal_store_path: Path,
+) -> dict[str, Any]:
+    from multimodal_pipeline import search_records, store_paths
+
+    limit = int(settings.get("multimodal_retrieval_limit", 10))
+    evidence = search_records(
+        question,
+        store_paths(multimodal_store_path),
+        embed_model=FIXED_MULTIMODAL_EMBED_MODEL,
+        ollama_base_url=settings.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL),
+        limit=limit,
+    )
+    evidence_text, evidence_references, artifact_references = build_multimodal_evidence_bundle(evidence)
+    system_prompt = build_rag_role_prompt()
+    user_prompt = (
+        "Answer the user question using only the retrieved workspace evidence.\n"
+        "Required behavior:\n"
+        "1. Cite factual claims with evidence IDs like [E1], [E2].\n"
+        "2. Mention table/image artifacts only when present in evidence.\n"
+        "3. If evidence is insufficient or conflicting, say so explicitly.\n"
+        "4. Keep output as clean Markdown with concise sections.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Retrieved evidence:\n{evidence_text}"
+    )
+    answer = llm_complete(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        settings,
+    )
+    return {
+        "answer": answer.strip(),
+        "answer_markdown": answer.strip(),
+        "evidence": evidence,
+        "evidence_references": evidence_references,
+        "artifact_references": artifact_references,
+    }
 
 
 def collect_strings(payload: Any) -> Iterable[str]:
@@ -947,13 +1002,13 @@ def build_research_role_prompt() -> str:
 
 
 def build_rag_role_prompt() -> str:
-    rag_skill = load_skill_file(AGENT_SKILLS_DIR, "vectorless_tree_reasoning_chat.md")
+    rag_skill = load_skill_file(AGENT_SKILLS_DIR, "multimodal_synthesizer_chat.md")
     if not rag_skill:
         return (
-            "You are a vectorless PageIndex research copilot. Reason over semantic tree structure and page-linked evidence. "
-            "Cite all document-grounded claims with [filename :: node_id :: pp. start-end :: title]."
+            "You are a multimodal scientific research copilot. Reason over retrieved text, tables, figures, and artifact references. "
+            "Cite all document-grounded claims with evidence IDs and artifact paths when available."
         )
-    return f"You are a vectorless PageIndex research copilot.\n\n{rag_skill}"
+    return f"You are a multimodal scientific research copilot.\n\n{rag_skill}"
 
 
 PLAN_HELP_TEXT = (
@@ -1216,387 +1271,6 @@ async def run_gpt_researcher(
     }
 
 
-def index_single_pdf(pdf_path: Path, settings: dict[str, Any], paths: RuntimePaths) -> dict[str, Any]:
-    started = time.perf_counter()
-    PAGEINDEX_LOGGER.info("Index request received for `%s`", pdf_path)
-    require_runtime_modules(settings)
-    configure_runtime_env(settings)
-    preflight_pageindex_backend(settings)
-    pdf_hash = sha256_file(pdf_path)
-    output_path = paths.pageindex_cache / f"{safe_slug(pdf_path.stem)}__{pdf_hash[:12]}_structure.json"
-    if output_path.exists():
-        PAGEINDEX_LOGGER.info("Cache hit for `%s` -> `%s`", pdf_path.name, output_path.name)
-        return {"status": "cached", "pdf": pdf_path, "output": output_path, "log": latest_pageindex_log_path(pdf_path.name)}
-
-    try:
-        from pageindex import page_index_main
-        from pageindex.utils import ConfigLoader
-    except Exception as exc:
-        raise RuntimeError(
-            "PageIndex is not importable. Install the environment with `pip install -r requirements.txt`."
-        ) from exc
-
-    user_opt = {
-        "model": pageindex_model_name(settings),
-        "toc_check_page_num": int(settings["pageindex_toc_pages"]),
-        "max_page_num_each_node": int(settings["pageindex_max_pages_per_node"]),
-        "max_token_num_each_node": int(settings["pageindex_max_tokens_per_node"]),
-        "if_add_node_id": "yes",
-        "if_add_node_summary": "yes",
-        "if_add_doc_description": "yes",
-        "if_add_node_text": "no",
-    }
-    PAGEINDEX_LOGGER.info(
-        "PageIndex options for `%s`: model=%s toc_pages=%s max_pages_per_node=%s max_tokens_per_node=%s timeout=%ss retries=%s temperature=%s top_p=%s",
-        pdf_path.name,
-        user_opt["model"],
-        user_opt["toc_check_page_num"],
-        user_opt["max_page_num_each_node"],
-        user_opt["max_token_num_each_node"],
-        settings.get("pageindex_llm_timeout_seconds", 180),
-        settings.get("pageindex_llm_max_retries", 3),
-        settings.get("pageindex_temperature", 0.0),
-        settings.get("pageindex_top_p", 1.0),
-    )
-    opt = ConfigLoader().load({key: value for key, value in user_opt.items() if value is not None})
-    try:
-        PAGEINDEX_LOGGER.info("Calling PageIndex engine for `%s`", pdf_path.name)
-        tree = page_index_main(str(pdf_path), opt)
-    except Exception as exc:
-        PAGEINDEX_LOGGER.error("PageIndex failed on `%s`: %s", pdf_path.name, exc)
-        PAGEINDEX_LOGGER.error(traceback.format_exc())
-        raise
-
-    payload = {
-        "schema_version": 1,
-        "source_pdf": str(pdf_path),
-        "source_pdf_name": pdf_path.name,
-        "source_sha256": pdf_hash,
-        "indexed_at": datetime.now().isoformat(timespec="seconds"),
-        "pageindex_model": user_opt["model"],
-        "tree": tree,
-    }
-    atomic_write_json(output_path, payload)
-    elapsed = time.perf_counter() - started
-    PAGEINDEX_LOGGER.info("Indexed `%s` in %.2fs -> `%s`", pdf_path.name, elapsed, output_path.name)
-    return {"status": "indexed", "pdf": pdf_path, "output": output_path, "log": latest_pageindex_log_path(pdf_path.name)}
-
-
-def write_workspace_manifest(paths: RuntimePaths) -> None:
-    entries = []
-    for cache_file in sorted(paths.pageindex_cache.glob("*_structure.json")):
-        try:
-            payload = json.loads(cache_file.read_text(encoding="utf-8"))
-            entries.append(
-                {
-                    "cache_file": str(cache_file),
-                    "source_pdf": payload.get("source_pdf"),
-                    "source_pdf_name": payload.get("source_pdf_name"),
-                    "source_sha256": payload.get("source_sha256"),
-                    "indexed_at": payload.get("indexed_at"),
-                    "pageindex_model": payload.get("pageindex_model"),
-                }
-            )
-        except Exception:
-            continue
-    atomic_write_json(
-        paths.pageindex_cache / "workspace_index.json",
-        {"generated_at": datetime.now().isoformat(timespec="seconds"), "entries": entries},
-    )
-
-
-def reindex_workspace(settings: dict[str, Any], paths: RuntimePaths) -> list[dict[str, Any]]:
-    pdfs = discover_pdfs(paths.bib_pdf)
-    PAGEINDEX_LOGGER.info(
-        "Workspace reindex started: %s PDF(s), backend=%s model=%s cache_dir=%s",
-        len(pdfs),
-        settings.get("backend"),
-        pageindex_model_name(settings),
-        paths.pageindex_cache,
-    )
-    results: list[dict[str, Any]] = []
-    for pdf_path in pdfs:
-        try:
-            results.append(index_single_pdf(pdf_path, settings, paths))
-        except Exception as exc:
-            results.append(
-                {
-                    "status": "error",
-                    "pdf": pdf_path,
-                    "output": None,
-                    "error": str(exc),
-                    "log": latest_pageindex_log_path(pdf_path.name),
-                }
-            )
-    write_workspace_manifest(paths)
-    summary = {
-        "indexed": sum(1 for item in results if item["status"] == "indexed"),
-        "cached": sum(1 for item in results if item["status"] == "cached"),
-        "errors": sum(1 for item in results if item["status"] == "error"),
-    }
-    PAGEINDEX_LOGGER.info("Workspace reindex completed: %s", summary)
-    return results
-
-
-def load_index_payloads(paths: RuntimePaths) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    if not paths.pageindex_cache.exists():
-        return payloads
-    for cache_file in sorted(paths.pageindex_cache.glob("*_structure.json")):
-        try:
-            payload = json.loads(cache_file.read_text(encoding="utf-8"))
-            if "tree" not in payload:
-                payload = {"schema_version": 0, "source_pdf_name": cache_file.stem, "source_pdf": "", "tree": payload}
-            payload["_cache_file"] = str(cache_file)
-            payloads.append(payload)
-        except Exception:
-            continue
-    return payloads
-
-
-def child_nodes(node: dict[str, Any]) -> list[Any]:
-    for key in ("nodes", "children", "subsections"):
-        value = node.get(key)
-        if isinstance(value, list):
-            return value
-    return []
-
-
-def flatten_nodes(tree: Any) -> list[dict[str, Any]]:
-    nodes: list[dict[str, Any]] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            if any(key in value for key in ("title", "node_id", "start_index", "summary")):
-                nodes.append(value)
-            for child in child_nodes(value):
-                visit(child)
-            if "structure" in value:
-                visit(value["structure"])
-        elif isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    visit(tree)
-    return nodes
-
-
-def find_node(tree: Any, node_id: str | None, title: str | None = None) -> dict[str, Any] | None:
-    candidates = flatten_nodes(tree)
-    if node_id:
-        for node in candidates:
-            if str(node.get("node_id", "")).strip() == str(node_id).strip():
-                return node
-    if title:
-        normalized = title.lower().strip()
-        for node in candidates:
-            if str(node.get("title", "")).lower().strip() == normalized:
-                return node
-    return None
-
-
-def coerce_page(value: Any) -> int | None:
-    if value is None:
-        return None
-    match = re.search(r"\d+", str(value))
-    return int(match.group(0)) if match else None
-
-
-def format_node_line(node: dict[str, Any], depth: int = 0) -> str:
-    title = str(node.get("title", "Untitled section"))
-    node_id = str(node.get("node_id", "no-node-id"))
-    start = node.get("start_index", "?")
-    end = node.get("end_index", "?")
-    summary = str(node.get("summary", "")).replace("\n", " ").strip()
-    indent = "  " * depth
-    return f"{indent}- node_id={node_id}; pages={start}-{end}; title={title}; summary={summary}"
-
-
-def format_tree(tree: Any, depth: int = 0, max_depth: int = 6) -> list[str]:
-    lines: list[str] = []
-    if depth > max_depth:
-        return lines
-    if isinstance(tree, dict):
-        if any(key in tree for key in ("title", "node_id", "start_index", "summary")):
-            lines.append(format_node_line(tree, depth))
-            next_depth = depth + 1
-        else:
-            next_depth = depth
-        if "structure" in tree:
-            lines.extend(format_tree(tree["structure"], next_depth, max_depth))
-        for child in child_nodes(tree):
-            lines.extend(format_tree(child, next_depth, max_depth))
-    elif isinstance(tree, list):
-        for item in tree:
-            lines.extend(format_tree(item, depth, max_depth))
-    return lines
-
-
-def build_tree_context(payloads: list[dict[str, Any]], char_budget: int) -> str:
-    sections: list[str] = []
-    used_chars = 0
-    for index, payload in enumerate(payloads, start=1):
-        doc_key = f"DOC_{index}"
-        header = (
-            f"\n### {doc_key}: {payload.get('source_pdf_name') or Path(payload.get('source_pdf', '')).name}\n"
-            f"source_pdf={payload.get('source_pdf', '')}\n"
-        )
-        lines = format_tree(payload.get("tree"))
-        block = header + "\n".join(lines)
-        if used_chars + len(block) > char_budget:
-            remaining = max(0, char_budget - used_chars)
-            if remaining > 1000:
-                sections.append(block[:remaining] + "\n[Tree context truncated at configured budget.]")
-            break
-        sections.append(block)
-        used_chars += len(block)
-    return "\n".join(sections).strip()
-
-
-def parse_json_response(text: str) -> dict[str, Any]:
-    clean = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, flags=re.DOTALL | re.IGNORECASE)
-    candidates = [fenced.group(1)] if fenced else []
-    object_match = re.search(r"\{.*\}", clean, flags=re.DOTALL)
-    if object_match:
-        candidates.append(object_match.group(0))
-    candidates.append(clean)
-    for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except Exception:
-            continue
-    return {}
-
-
-def extract_pdf_pages(pdf_path: Path, start_page: int | None, end_page: int | None, max_chars: int = 7000) -> str:
-    if not pdf_path.exists():
-        return ""
-    start = max(1, start_page or 1)
-    end = max(start, end_page or start)
-    text_parts: list[str] = []
-    try:
-        import fitz
-
-        document = fitz.open(pdf_path)
-        page_count = document.page_count
-        end = min(end, page_count)
-        for page_number in range(start, end + 1):
-            page_text = document.load_page(page_number - 1).get_text("text")
-            text_parts.append(f"\n[page {page_number}]\n{page_text}")
-            if sum(len(part) for part in text_parts) >= max_chars:
-                break
-        document.close()
-    except Exception:
-        try:
-            from PyPDF2 import PdfReader
-
-            reader = PdfReader(str(pdf_path))
-            end = min(end, len(reader.pages))
-            for page_number in range(start, end + 1):
-                page_text = reader.pages[page_number - 1].extract_text() or ""
-                text_parts.append(f"\n[page {page_number}]\n{page_text}")
-                if sum(len(part) for part in text_parts) >= max_chars:
-                    break
-        except Exception:
-            return ""
-    joined = "\n".join(text_parts)
-    return joined[:max_chars]
-
-
-def build_evidence_blocks(
-    selected_sections: list[dict[str, Any]],
-    payloads: list[dict[str, Any]],
-    max_sections: int = 8,
-) -> str:
-    blocks: list[str] = []
-    for section in selected_sections[:max_sections]:
-        doc_key = str(section.get("doc_key", "")).strip()
-        match = re.search(r"\d+", doc_key)
-        if not match:
-            continue
-        doc_index = int(match.group(0)) - 1
-        if doc_index < 0 or doc_index >= len(payloads):
-            continue
-        payload = payloads[doc_index]
-        node = find_node(payload.get("tree"), section.get("node_id"), section.get("title"))
-        if not node:
-            continue
-        pdf_path = Path(payload.get("source_pdf", ""))
-        start = coerce_page(node.get("start_index"))
-        end = coerce_page(node.get("end_index"))
-        title = str(node.get("title", "Untitled section"))
-        node_id = str(node.get("node_id", "no-node-id"))
-        page_text = extract_pdf_pages(pdf_path, start, end)
-        summary = str(node.get("summary", "")).strip()
-        blocks.append(
-            f"### {doc_key} | {payload.get('source_pdf_name')} | node_id={node_id} | pages={start}-{end} | {title}\n"
-            f"PageIndex summary: {summary}\n"
-            f"Extracted page-range evidence:\n{page_text}"
-        )
-    return "\n\n".join(blocks)
-
-
-def answer_workspace_question(
-    question: str,
-    settings: dict[str, Any],
-    paths: RuntimePaths,
-    chat_history: list[dict[str, str]],
-) -> str:
-    payloads = load_index_payloads(paths)
-    if not payloads:
-        return "No PageIndex cache is loaded yet. Add PDFs to the staging room and run PageIndex indexing first."
-
-    rag_role_prompt = build_rag_role_prompt()
-    tree_context = build_tree_context(payloads, int(settings["tree_context_budget"]))
-    selector_messages = [
-        {
-            "role": "system",
-            "content": (
-                f"{rag_role_prompt}\n\n"
-                "Task phase: section selection only.\n"
-                "Select the most relevant document sections by reasoning over the semantic tree only. "
-                "Return strict JSON with this shape: "
-                '{"sections":[{"doc_key":"DOC_1","node_id":"0001","title":"section title","reason":"brief reason"}]}. '
-                "Select no more than 8 sections."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Question:\n{question}\n\nPageIndex tree context:\n{tree_context}",
-        },
-    ]
-    selector_text = llm_complete(selector_messages, settings, temperature=0.0, max_tokens=1400)
-    selected = parse_json_response(selector_text).get("sections", [])
-    if not isinstance(selected, list):
-        selected = []
-    evidence = build_evidence_blocks(selected, payloads)
-
-    recent_history = "\n".join(
-        f"{message['role']}: {message['content']}" for message in chat_history[-6:] if message.get("content")
-    )
-    final_messages = [
-        {
-            "role": "system",
-            "content": (
-                f"{rag_role_prompt}\n\n"
-                "Do not use vector-search language, embeddings, nearest neighbors, or similarity scores. "
-                "Use only the supplied semantic tree and extracted page-range evidence. "
-                "Cite every document-grounded claim with [filename :: node_id :: pp. start-end :: title]. "
-                "If the evidence is insufficient, state exactly what is missing."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"User question:\n{question}\n\nRecent conversation:\n{recent_history}\n\n"
-                f"PageIndex tree context:\n{tree_context}\n\nSelected page-range evidence:\n{evidence or 'No page text extracted; answer only from tree summaries.'}"
-            ),
-        },
-    ]
-    return llm_complete(final_messages, settings)
-
-
 def clean_latex_response(text: str) -> str:
     clean = text.strip()
     clean = re.sub(r"^```(?:latex|tex)?\s*", "", clean, flags=re.IGNORECASE)
@@ -1687,14 +1361,14 @@ def safe_toast(message: str) -> None:
 def missing_runtime_modules(settings: dict[str, Any]) -> list[str]:
     required_modules = [
         "gpt_researcher",
-        "pageindex",
         "litellm",
         "openai",
         "dotenv",
         "fitz",
         "PyPDF2",
         "requests",
-        "langchain_mcp_adapters",
+        "qdrant_client",
+        "mineru",
     ]
     safe_retriever = sanitize_retriever(settings.get("retriever", "duckduckgo"))
     if "duckduckgo" in safe_retriever.split(","):
@@ -1803,6 +1477,35 @@ st.markdown(
     textarea {font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;}
     .stTabs [data-baseweb="tab-list"] {gap: 0.4rem;}
     .stTabs [data-baseweb="tab"] {height: 2.6rem; padding-left: 1rem; padding-right: 1rem;}
+    div[data-testid="stChatMessage"] {
+        border: 1px solid rgba(128, 128, 128, 0.2);
+        border-radius: 12px;
+        padding: 0.65rem 0.9rem;
+        margin-bottom: 0.65rem;
+        background: var(--secondary-background-color);
+    }
+    div[data-testid="stChatMessage"] table {
+        width: 100%;
+        font-size: 0.92rem;
+    }
+    div[data-testid="stChatMessage"] th, div[data-testid="stChatMessage"] td {
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+        padding: 0.42rem 0.5rem;
+        vertical-align: top;
+    }
+    div[data-testid="stChatMessage"] pre {
+        border-radius: 8px;
+        border: 1px solid rgba(128, 128, 128, 0.22);
+    }
+    .st-key-multimodal_chat_input {
+        position: sticky;
+        bottom: 0;
+        z-index: 30;
+        background: var(--background-color);
+        padding-top: 0.45rem;
+        padding-bottom: 0.2rem;
+        border-top: 1px solid rgba(128, 128, 128, 0.18);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1919,43 +1622,26 @@ with st.sidebar:
             value=max(3.0, env_float("ARXIV_DELAY_SECONDS", 4.0)),
         )
         arxiv_num_retries = st.number_input("arXiv retries", min_value=0, max_value=8, value=env_int("ARXIV_NUM_RETRIES", 4))
-        pageindex_toc_pages = st.number_input("PageIndex ToC scan pages", min_value=1, max_value=80, value=int(os.getenv("PAGEINDEX_TOC_CHECK_PAGES", "20")))
-        pageindex_max_pages_per_node = st.number_input(
-            "Max pages per node", min_value=1, max_value=80, value=int(os.getenv("PAGEINDEX_MAX_PAGES_PER_NODE", "12"))
+        st.markdown("**Multimodal RAG defaults**")
+        multimodal_text_model = st.text_input("RAG text model", value=os.getenv("MULTIMODAL_TEXT_MODEL", "gpt-oss:20b"))
+        multimodal_image_model = st.text_input("Vision caption model", value=os.getenv("MULTIMODAL_IMAGE_MODEL", "llama3.2-vision:11b"))
+        multimodal_embed_model = FIXED_MULTIMODAL_EMBED_MODEL
+        st.caption(f"Multimodal embeddings: `{multimodal_embed_model}` (fixed)")
+        mineru_backend = st.selectbox(
+            "MinerU backend",
+            ["pipeline", "hybrid-auto-engine", "vlm-auto-engine"],
+            index=["pipeline", "hybrid-auto-engine", "vlm-auto-engine"].index(os.getenv("MINERU_BACKEND", "pipeline"))
+            if os.getenv("MINERU_BACKEND", "pipeline") in ["pipeline", "hybrid-auto-engine", "vlm-auto-engine"]
+            else 0,
         )
-        pageindex_max_tokens_per_node = st.number_input(
-            "Max tokens per node", min_value=1000, max_value=100000, step=1000, value=int(os.getenv("PAGEINDEX_MAX_TOKENS_PER_NODE", "20000"))
+        mineru_method = st.selectbox(
+            "MinerU method",
+            ["auto", "txt", "ocr"],
+            index=["auto", "txt", "ocr"].index(os.getenv("MINERU_METHOD", "auto")) if os.getenv("MINERU_METHOD", "auto") in ["auto", "txt", "ocr"] else 0,
         )
-        pageindex_llm_timeout_seconds = st.number_input(
-            "PageIndex LLM timeout (seconds)",
-            min_value=20,
-            max_value=1200,
-            step=10,
-            value=env_int("PAGEINDEX_LLM_TIMEOUT_SECONDS", 180),
-        )
-        pageindex_llm_max_retries = st.number_input(
-            "PageIndex LLM retries",
-            min_value=1,
-            max_value=10,
-            value=env_int("PAGEINDEX_LLM_MAX_RETRIES", 3),
-        )
-        pageindex_temperature = st.number_input(
-            "PageIndex temperature",
-            min_value=0.0,
-            max_value=2.0,
-            step=0.05,
-            value=env_float("PAGEINDEX_TEMPERATURE", 0.0),
-        )
-        pageindex_top_p = st.number_input(
-            "PageIndex top-p",
-            min_value=0.05,
-            max_value=1.0,
-            step=0.05,
-            value=env_float("PAGEINDEX_TOP_P", 1.0),
-        )
-        tree_context_budget = st.number_input(
-            "Tree context char budget", min_value=8000, max_value=250000, step=1000, value=int(os.getenv("TREE_CONTEXT_CHAR_BUDGET", "45000"))
-        )
+        mineru_lang = st.text_input("MinerU language", value=os.getenv("MINERU_LANG", "en"))
+        mineru_timeout = st.number_input("MinerU timeout seconds", min_value=300, max_value=7200, step=300, value=env_int("MINERU_TIMEOUT", 1800))
+        multimodal_retrieval_limit = st.number_input("RAG retrieved evidence items", min_value=3, max_value=40, value=env_int("MULTIMODAL_RETRIEVAL_LIMIT", 10))
         st.caption(f"Agent skills: {AGENT_SKILLS_DIR}")
 
     with st.expander("LLM generation controls", expanded=False):
@@ -1990,7 +1676,7 @@ with st.sidebar:
 
     with st.expander("Workspace paths", expanded=False):
         bib_pdf_raw = st.text_input("PDF staging directory", value=os.getenv("BIB_PDF_DIR", "./bib_pdf"))
-        pageindex_cache_raw = st.text_input("PageIndex cache directory", value=os.getenv("PAGEINDEX_CACHE_DIR", "./pageindex_cache"))
+        multimodal_store_raw = st.text_input("Multimodal store directory", value=os.getenv("MULTIMODAL_STORE_DIR", "./multimodal_store"))
         compiled_output_raw = st.text_input("Compile output directory", value=os.getenv("COMPILED_OUTPUT_DIR", "./compiled_output"))
         paper_tex_raw = st.text_input("LaTeX source path", value=os.getenv("PAPER_TEX_PATH", "./paper.tex"))
 
@@ -2032,29 +1718,31 @@ settings = {
     "arxiv_num_retries": int(arxiv_num_retries),
     "language": os.getenv("LANGUAGE", "english"),
     "curate_sources": os.getenv("CURATE_SOURCES", "true").lower() == "true",
-    "pageindex_toc_pages": int(pageindex_toc_pages),
-    "pageindex_max_pages_per_node": int(pageindex_max_pages_per_node),
-    "pageindex_max_tokens_per_node": int(pageindex_max_tokens_per_node),
-    "pageindex_llm_timeout_seconds": int(pageindex_llm_timeout_seconds),
-    "pageindex_llm_max_retries": int(pageindex_llm_max_retries),
-    "pageindex_temperature": float(pageindex_temperature),
-    "pageindex_top_p": float(pageindex_top_p),
-    "tree_context_budget": int(tree_context_budget),
+    "multimodal_text_model": multimodal_text_model,
+    "multimodal_image_model": multimodal_image_model,
+    "multimodal_embed_model": multimodal_embed_model,
+    "mineru_backend": mineru_backend,
+    "mineru_method": mineru_method,
+    "mineru_lang": mineru_lang,
+    "mineru_timeout": int(mineru_timeout),
+    "multimodal_retrieval_limit": int(multimodal_retrieval_limit),
 }
 
 paths = RuntimePaths(
     bib_pdf=resolve_workspace_path(bib_pdf_raw),
-    pageindex_cache=resolve_workspace_path(pageindex_cache_raw),
     compiled_output=resolve_workspace_path(compiled_output_raw),
     paper_tex=resolve_workspace_path(paper_tex_raw),
 )
+multimodal_store_path = resolve_workspace_path(multimodal_store_raw)
 created_paper = ensure_bootstrap_files(paths, workspace_title)
 sync_latex_session(paths.paper_tex)
 missing_modules = missing_runtime_modules(settings)
 
 st.title(workspace_title)
 st.caption(f"Active model: {settings['backend']} / {settings['model']} | Paper: {paths.paper_tex.relative_to(ROOT) if paths.paper_tex.is_relative_to(ROOT) else paths.paper_tex}")
-st.caption(f"Engines: GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | PageIndex `{PAGEINDEX_ENGINE_PATH}` | Retriever `{effective_retriever(settings)}`")
+st.caption(
+    f"Engines: GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | Multimodal store `{multimodal_store_path}` | Retriever `{effective_retriever(settings)}`"
+)
 if created_paper:
     safe_toast(f"Initialized {paths.paper_tex.name}")
 if missing_modules:
@@ -2065,7 +1753,11 @@ if missing_modules:
     )
 
 tab_search, tab_chat, tab_latex = st.tabs(
-    ["Deep Search & PageIndex Curation", "Vectorless Tree-Reasoning RAG Chat", "Live LaTeX Studio & Local Compiling"]
+    [
+        "Deep Search & Multimodal Indexing",
+        "Agentic Multimodal RAG Chat",
+        "Live LaTeX Studio & Local Compiling",
+    ]
 )
 
 
@@ -2218,13 +1910,33 @@ with tab_search:
             st.button("Add Query Row", width="stretch", on_click=append_blank_plan_item)
 
     with right:
-        st.subheader("Structural Staging Room")
+        st.subheader("Multimodal Staging Room")
+        try:
+            from multimodal_pipeline import clean_store, ingest_pdf, store_summary
+        except Exception as exc:
+            clean_store = None
+            ingest_pdf = None
+            store_summary = None
+            st.error("Multimodal pipeline is not available.")
+            st.code(str(exc), language="text")
+
         pdfs = discover_pdfs(paths.bib_pdf)
-        cache_payloads = load_index_payloads(paths)
+        multimodal_summary = store_summary(multimodal_store_path) if store_summary else {
+            "documents": 0,
+            "text_chunks": 0,
+            "tables": 0,
+            "images": 0,
+            "vector_records": 0,
+        }
         metrics = st.columns(3)
         metrics[0].metric("Staged PDFs", len(pdfs))
-        metrics[1].metric("Indexed trees", len(cache_payloads))
-        metrics[2].metric("Reports", len(list(paths.bib_pdf.glob("*.md"))) if paths.bib_pdf.exists() else 0)
+        metrics[1].metric("Indexed docs", multimodal_summary.get("documents", 0))
+        metrics[2].metric("Vector records", multimodal_summary.get("vector_records", 0))
+        artifact_metrics = st.columns(3)
+        artifact_metrics[0].metric("Text chunks", multimodal_summary.get("text_chunks", 0))
+        artifact_metrics[1].metric("Tables", multimodal_summary.get("tables", 0))
+        artifact_metrics[2].metric("Images", multimodal_summary.get("images", 0))
+        st.caption(f"Store: `{multimodal_store_path}`")
 
         if pdfs:
             st.dataframe(
@@ -2242,35 +1954,67 @@ with tab_search:
         else:
             st.info(f"No PDFs found in {paths.bib_pdf}")
 
-        if st.button("🔄 Re-Index Workspace Base via PageIndex", type="primary", width="stretch"):
+        index_col, reset_col = st.columns([0.7, 0.3])
+        if index_col.button("🔄 Index Workspace With MinerU + Multimodal RAG", type="primary", width="stretch"):
             if not pdfs:
                 st.warning("Add PDFs to the staging directory before indexing.")
+            elif ingest_pdf is None:
+                st.error("Multimodal pipeline is not available.")
             else:
-                with st.spinner("PageIndex is building semantic section trees..."):
-                    results = reindex_workspace(settings, paths)
-                    indexed = sum(1 for item in results if item["status"] == "indexed")
-                    cached = sum(1 for item in results if item["status"] == "cached")
-                    errors = [item for item in results if item["status"] == "error"]
-                    if errors:
-                        st.error(f"PageIndex finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
-                    else:
-                        safe_toast("PageIndex tree indices locked and loaded")
-                        st.success(f"Indexed {indexed} PDF(s); reused {cached} cached tree(s).")
-                    st.caption("Detailed PageIndex execution logs are printed to terminal and persisted under `./logs/`.")
-                    st.dataframe(
-                        [
-                            {
-                                "status": item["status"],
-                                "pdf": item["pdf"].name,
-                                "cache": str(item["output"]) if item.get("output") else "",
-                                "error": item.get("error", ""),
-                                "log": item.get("log", ""),
-                            }
-                            for item in results
-                        ],
-                        width="stretch",
-                        hide_index=True,
+                results: list[dict[str, Any]] = []
+                progress = st.progress(0)
+                with st.status("Preparing multimodal indexing...", expanded=True) as status:
+                    st.write(f"Found {len(pdfs)} staged PDF(s).")
+                    st.write(
+                        "Using MinerU parsing, Ollama vision captioning, fixed mpnet embeddings, and local Qdrant indexing."
                     )
+                    for index, pdf_path in enumerate(pdfs, start=1):
+                        status.update(label=f"Indexing {index}/{len(pdfs)}: {pdf_path.name}", state="running")
+                        st.write(f"Parsing and enriching `{pdf_path.name}`...")
+                        try:
+                            result = ingest_pdf(
+                                pdf_path,
+                                store_root=multimodal_store_path,
+                                text_model=settings["multimodal_text_model"],
+                                image_model=settings["multimodal_image_model"],
+                                embed_model=settings["multimodal_embed_model"],
+                                ollama_base_url=settings["ollama_base_url"],
+                                use_mineru=True,
+                                mineru_backend=settings["mineru_backend"],
+                                mineru_method=settings["mineru_method"],
+                                mineru_lang=settings["mineru_lang"],
+                                mineru_timeout=int(settings["mineru_timeout"]),
+                                enrich_images=True,
+                                enrich_tables=True,
+                                index=True,
+                                force=True,
+                            )
+                            results.append(result)
+                            st.write(
+                                f"Indexed `{pdf_path.name}` with `{result.get('parser')}`: "
+                                f"{result.get('vector_records', 0)} vectors, {result.get('images', 0)} images."
+                            )
+                        except Exception as exc:
+                            results.append({"status": "error", "source_pdf": str(pdf_path), "error": str(exc)})
+                            st.write(f"Error indexing `{pdf_path.name}`: {exc}")
+                        progress.progress(index / len(pdfs))
+                    errors = [item for item in results if item.get("status") == "error"]
+                    if errors:
+                        status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
+                        st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
+                    else:
+                        status.update(label="Multimodal index is ready", state="complete")
+                        safe_toast("Multimodal RAG index ready")
+                        st.success(f"Indexed {len(results)} PDF(s) into `{multimodal_store_path}`.")
+                st.dataframe(summarize_multimodal_results(results), width="stretch", hide_index=True)
+
+        if reset_col.button("Reset Index", width="stretch"):
+            if clean_store is None:
+                st.error("Multimodal pipeline is not available.")
+            else:
+                clean_store(multimodal_store_path)
+                safe_toast("Multimodal index reset")
+                st.rerun()
 
     # Full-width report viewer (persists across tab switches)
     st.divider()
@@ -2300,57 +2044,74 @@ with tab_search:
 
 with tab_chat:
     st.subheader("Workspace Cross-Examination")
+    try:
+        from multimodal_pipeline import store_summary
+
+        chat_store_summary = store_summary(multimodal_store_path)
+    except Exception as exc:
+        chat_store_summary = {"documents": 0, "vector_records": 0, "images": 0, "tables": 0}
+        st.error("Multimodal retrieval backend is not available.")
+        st.code(str(exc), language="text")
+
+    metrics = st.columns(4)
+    metrics[0].metric("Indexed docs", chat_store_summary.get("documents", 0))
+    metrics[1].metric("Vector records", chat_store_summary.get("vector_records", 0))
+    metrics[2].metric("Images", chat_store_summary.get("images", 0))
+    metrics[3].metric("Tables", chat_store_summary.get("tables", 0))
+    st.caption(
+        f"Query backend: Qdrant `{multimodal_store_path}` | generation: "
+        f"{settings['backend']} / `{settings['model']}` | embeddings `{settings['multimodal_embed_model']}`"
+    )
+
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
-    if "pending_chat_question" not in st.session_state:
-        st.session_state["pending_chat_question"] = None
-    if "rag_chat_draft" not in st.session_state:
-        st.session_state["rag_chat_draft"] = ""
+    if "chat_pending_question" not in st.session_state:
+        st.session_state["chat_pending_question"] = ""
 
-    toolbar_cols = st.columns([0.24, 0.76])
+    toolbar_cols = st.columns([0.2, 0.8])
     if toolbar_cols[0].button("Clear conversation", width="stretch"):
         st.session_state["chat_messages"] = []
-        st.session_state["pending_chat_question"] = None
-        st.session_state["rag_chat_draft"] = ""
+        st.session_state["chat_pending_question"] = ""
         st.rerun()
 
-    with st.container(border=True):
-        st.markdown("**Ask the indexed workspace**")
-        with st.form("rag_chat_composer", clear_on_submit=True):
-            st.text_area(
-                "Question",
-                key="rag_chat_draft",
-                height=130,
-                placeholder="Ask a high-precision question. Example: Compare weak supervision vs zero-shot methods and cite exact sections/pages.",
-                label_visibility="collapsed",
-            )
-            submit_cols = st.columns([0.22, 0.78])
-            submitted = submit_cols[0].form_submit_button("Ask", type="primary", width="stretch")
-            if submitted:
-                candidate = st.session_state.get("rag_chat_draft", "").strip()
-                if candidate:
-                    st.session_state["pending_chat_question"] = candidate
-                    st.rerun()
+    st.markdown("**Ask the indexed workspace**")
+
+    queued_question = st.session_state.get("chat_pending_question", "").strip()
+    if queued_question:
+        # Pop first to avoid infinite retry loops on generation errors.
+        st.session_state["chat_pending_question"] = ""
+        with st.spinner(
+            f"Retrieving Qdrant evidence and synthesizing with {settings['backend']} / {settings['model']}..."
+        ):
+            try:
+                response = multimodal_chat_answer(
+                    queued_question,
+                    settings=settings,
+                    multimodal_store_path=multimodal_store_path,
+                )
+                answer = response["answer_markdown"]
+                artifacts = response.get("artifact_references", [])
+            except Exception as exc:
+                answer = f"RAG chat failed:\n\n```text\n{exc}\n```"
+                artifacts = []
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer, "artifacts": artifacts})
+        st.rerun()
 
     for message in st.session_state["chat_messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message.get("artifacts"):
+                render_artifacts(message["artifacts"])
 
-    pending_question = st.session_state.get("pending_chat_question")
+    pending_question = st.chat_input(
+        "Ask a high-precision question about papers, datasets, methods, tables, and figures...",
+        key="multimodal_chat_input",
+        width="stretch",
+    )
     if pending_question:
-        st.session_state["pending_chat_question"] = None
         st.session_state["chat_messages"].append({"role": "user", "content": pending_question})
-        with st.chat_message("user"):
-            st.markdown(pending_question)
-        with st.chat_message("assistant"):
-            with st.spinner("Reasoning over PageIndex section trees..."):
-                try:
-                    answer = answer_workspace_question(pending_question, settings, paths, st.session_state["chat_messages"])
-                    st.markdown(answer)
-                except Exception as exc:
-                    answer = f"RAG chat failed:\n\n```text\n{exc}\n```"
-                    st.markdown(answer)
-        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+        st.session_state["chat_pending_question"] = pending_question
+        st.rerun()
 
 
 with tab_latex:
@@ -2404,8 +2165,3 @@ with tab_latex:
                 mime="application/pdf",
                 width="stretch",
             )
-
-        manifest_path = paths.pageindex_cache / "workspace_index.json"
-        if manifest_path.exists():
-            with st.expander("Current PageIndex manifest", expanded=False):
-                st.json(json.loads(manifest_path.read_text(encoding="utf-8")))

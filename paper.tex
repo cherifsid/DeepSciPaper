@@ -1,31 +1,46 @@
-\documentclass[11pt]{article}
-\usepackage[margin=1in]{geometry}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{graphicx}
-\usepackage{xcolor}
-\usepackage{hyperref}
-\usepackage{enumitem}
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.85, transform shape,
+    box/.style={rectangle, draw=blue!70!black, fill=blue!5, rounded corners=3pt, minimum width=4.2cm, minimum height=1.1cm, align=center, font=\small, thick},
+    proc/.style={rectangle, draw=purple!70!black, fill=purple!5, rounded corners=3pt, minimum width=4.2cm, minimum height=1.1cm, align=center, font=\small, thick},
+    llmbox/.style={rectangle, draw=orange!80!black, fill=orange!10, rounded corners=3pt, minimum width=4.2cm, minimum height=1.1cm, align=center, font=\small, thick},
+    finalbox/.style={rectangle, draw=green!70!black, fill=green!5, rounded corners=3pt, minimum width=6cm, minimum height=1.2cm, align=center, font=\small, thick},
+    line/.style={-{Latex[length=3mm]}, thick}
+]
 
-\title{DeepSciPaper Workspace}
-\author{Research Copilot}
-\date{\today}
+% Left Branch: OpenAlex Augmentation Pipeline
+\node[box] (openalex) {\textbf{OpenAlex API Query}\\Filter: SDG 17 ID};
+\node[proc, below=1.2cm of openalex] (index) {\textbf{Inverted Index Extraction}\\\texttt{abstract\_inverted\_index}};
+\node[proc, below=1.2cm of index] (reconstruct) {\textbf{Token Coordinate Mapping}\\Positional String Reassembly};
+\node[llmbox, below=1.2cm of reconstruct] (llm) {\textbf{Zero-Shot LLM Audit}\\Contextual Denoising Layer};
 
-\begin{document}
-\maketitle
+% Right Branch: Base OSDG Processing
+\node[box, right=2.5cm of openalex] (osdg) {\textbf{Raw OSDG-CD Corpus}\\Classes 1--16};
+\node[proc, below=2.3cm of osdg] (filter) {\textbf{Consensus Filtering}\\Threshold: $\text{agreement} > 0.1$};
 
-\begin{abstract}
-This is a bootstrap LaTeX manuscript for the DeepSciPaper Research Copilot. The Streamlit app will keep the source synchronized and can compile it locally via \texttt{pdflatex}.
-\end{abstract}
+% Convergence Level
+\coordinate (mergepoint) at ($(llm.south)!0.5!(filter.south)$);
+\node[proc, below=1.8cm of mergepoint, minimum width=6.5cm] (concat) {\textbf{Vertical Corpus Concatenation}\\Structural Class Stacking};
+\node[finalbox, below=1.2cm of concat] (final) {\textbf{Standardized 17-Class Training Set}\\Balanced and Denoised Input Matrix};
 
-\section{Research Aim}
-Replace this text with the specific research aim for your workspace.
+% Connecting Arrows (Straight Vertical)
+\draw[line] (openalex) -- (index);
+\draw[line] (index) -- (reconstruct);
+\draw[line] (reconstruct) -- (llm);
+\draw[line] (osdg) -- (filter);
 
-\section{Evidence Base}
-Primary PDFs are staged under \texttt{bib\_pdf/}. PageIndex semantic trees are cached under \texttt{pageindex\_cache/}.
+% FIXED ROUTING for Merge arrows
+% 1. Start at the bottom of the upper node
+% 2. Drop straight down exactly 0.8cm
+% 3. Move horizontally and then drop vertically straight onto the target points
+\draw[line, rounded corners=3pt] (llm.south) -- ++(0,-0.8cm) -| ($(concat.north) + (-1.5cm, 0)$);
+\draw[line, rounded corners=3pt] (filter.south) -- ++(0,-0.8cm) -| ($(concat.north) + (1.5cm, 0)$);
 
-\section{Draft Synthesis}
-Start writing here. When possible, cite with page/section references derived from PageIndex.
+% Final step arrow
+\draw[line] (concat) -- (final);
 
-\end{document}
-
+\end{tikzpicture}
+\caption{Data integration and verification pipeline. OpenAlex inverted tracking vectors are decoded and algorithmically denoised before merging with filtered OSDG consensus data.}
+\label{fig:augmentation_pipeline}
+\end{figure}

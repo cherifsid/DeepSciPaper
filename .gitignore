@@ -1,6 +1,7 @@
 .env.local
 .env
 .env.*
+!.env.example
 *.aux
 *.bbl
 *.bcf
@@ -13,8 +14,8 @@
 *.synctex.gz
 *.pdf
 compiled_output/
-pageindex_cache/
 results/
+multimodal_store/
 __pycache__/
 .streamlit/secrets.toml
 logs/
