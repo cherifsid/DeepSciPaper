@@ -1,6 +1,5 @@
 streamlit>=1.35.0
 gpt-researcher==0.14.8
-pageindex==0.2.8
 openai>=1.75.0
 python-dotenv==1.2.2
 litellm>=1.84.0
@@ -17,3 +16,10 @@ langchain-ollama>=0.2.0
 langchain-deepseek>=0.1.0
 langchain-mcp-adapters>=0.1.0
 botocore
+qdrant-client>=1.14.0
+watchdog>=4.0.0
+mineru>=2.0.0
+shapely>=2.0.0
+pyclipper>=1.3.0
+transformers>=4.41.0,<5.0.0
+sentence-transformers>=3.0.0

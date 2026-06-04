@@ -9,7 +9,7 @@ This folder contains human-authored playbooks that the Deep Search agent (GPT Re
 
 The app concatenates these markdown files into a single "agent role" instruction prompt and passes it to GPT Researcher as `role=...`.
 
-For RAG chat, `vectorless_tree_reasoning_chat.md` is loaded as a dedicated skill guide for PageIndex structural reasoning and citation discipline.
+For RAG chat, `multimodal_synthesizer_chat.md` is loaded as a dedicated skill guide for multimodal evidence synthesis and citation discipline.
 
 Design goals:
 - reproducible, evidence-grounded reports
