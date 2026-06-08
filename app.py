@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html
 import importlib.util
@@ -10,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import logging
 import traceback
@@ -22,7 +24,25 @@ from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
+
+from case_management import (
+    append_chat_message as persist_chat_message,
+    case_paths,
+    clear_chat_messages as clear_case_chat_history,
+    create_case as create_managed_case,
+    db_path as case_db_path,
+    ensure_legacy_case,
+    get_case_by_slug,
+    init_db as init_case_db,
+    latest_sync_event,
+    list_cases as list_managed_cases,
+    list_chat_messages as load_case_chat_messages,
+    minio_is_configured,
+    sync_case_to_minio,
+    update_case_metadata,
+)
 
 
 load_dotenv()
@@ -494,6 +514,44 @@ def build_llm_kwargs(settings: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def runtime_preflight(
+    settings: dict[str, Any],
+    paths: RuntimePaths,
+    *,
+    multimodal_store_path: Path | None = None,
+    graph_store_path: Path | None = None,
+    require_pdfs: bool = False,
+    require_multimodal_index: bool = False,
+    require_graph_index: bool = False,
+    require_paper: bool = False,
+) -> list[str]:
+    issues: list[str] = []
+    if not settings.get("model", "").strip():
+        issues.append("Select a model name in the sidebar.")
+    if settings.get("backend") == "Local Ollama":
+        if not settings.get("ollama_base_url", "").strip():
+            issues.append("Set the Ollama base URL in the sidebar.")
+    else:
+        if not settings.get("api_key", "").strip():
+            provider = settings.get("cloud_provider", "cloud provider")
+            issues.append(f"Add a {provider} API key in the sidebar.")
+
+    if require_pdfs and not discover_pdfs(paths.bib_pdf):
+        issues.append(f"No PDFs were found in `{paths.bib_pdf}`.")
+    if require_multimodal_index and multimodal_store_path is not None:
+        has_records = any(multimodal_store_path.glob("indexes/*_records.json"))
+        if not has_records:
+            issues.append("The multimodal index is empty. Click Index before asking Standard RAG questions.")
+    if require_graph_index and graph_store_path is not None:
+        has_graphs = any(graph_store_path.glob("graphs/*/graph.json"))
+        if not has_graphs:
+            issues.append("The graph RAG store is empty. Run Index before using Research Mode.")
+    if require_paper and not paths.paper_tex.exists():
+        issues.append(f"The LaTeX source file is missing: `{paths.paper_tex}`.")
+
+    return issues
+
+
 def litellm_model_name(settings: dict[str, Any]) -> str:
     raw_model = settings["model"].strip()
     if settings["backend"] == "Local Ollama":
@@ -788,7 +846,11 @@ def render_artifacts(artifact_references: list[dict[str, Any]]) -> None:
         return
     with st.expander("Image and table artifacts", expanded=False):
         st.dataframe(artifact_references, width="stretch", hide_index=True)
-        image_refs = [item for item in artifact_references if item.get("modality") == "image" and item.get("asset_path")]
+        image_refs = [
+            item
+            for item in artifact_references
+            if (item.get("modality") == "image" or item.get("node_type") == "figure") and item.get("asset_path")
+        ]
         if image_refs:
             image_cols = st.columns(2)
             for index, item in enumerate(image_refs[:8]):
@@ -799,6 +861,224 @@ def render_artifacts(artifact_references: list[dict[str, Any]]) -> None:
                         caption=f"{item.get('source_pdf_name', '')} | {item.get('title', '')}",
                         width="stretch",
                     )
+
+
+def clean_markdown_for_display(text: str) -> str:
+    clean = html.unescape(text or "")
+    clean = re.sub(r"!\[[^\]]*]\(([^)]+)\)", "", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
+
+
+def render_markdown_block(text: str) -> None:
+    st.markdown(clean_markdown_for_display(text), unsafe_allow_html=True)
+
+
+def pdf_embed_html(pdf_path: Path, height: int = 440) -> str:
+    encoded = base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
+    return (
+        f'<div style="height:{height}px; overflow:auto; border:1px solid rgba(128,128,128,0.2); border-radius:10px; background:#fff;">'
+        f'<object data="data:application/pdf;base64,{encoded}" type="application/pdf" '
+        f'width="100%" height="{max(height - 8, 240)}" style="display:block;">'
+        f'<embed src="data:application/pdf;base64,{encoded}" type="application/pdf" width="100%" height="{max(height - 8, 240)}"></embed>'
+        "</object>"
+        "</div>"
+    )
+
+
+def render_pdf_preview(pdf_path: Path, max_pages: int = 2) -> tuple[list[bytes], int]:
+    import fitz
+
+    previews: list[bytes] = []
+    with fitz.open(pdf_path) as doc:
+        page_total = len(doc)
+        for page_index in range(min(max_pages, page_total)):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+            previews.append(pix.tobytes("png"))
+    return previews, page_total
+
+
+def request_workspace_tab_switch(tab_name: str) -> None:
+    st.session_state["workspace_tab_switch"] = tab_name
+
+
+def maybe_switch_workspace_tab() -> None:
+    target = st.session_state.pop("workspace_tab_switch", "")
+    if not target:
+        return
+    escaped = json.dumps(target)
+    components.html(
+        f"""
+        <script>
+        const target = {escaped};
+        const doc = window.parent.document;
+        const clickTab = () => {{
+          const buttons = Array.from(doc.querySelectorAll('button[role="tab"]'));
+          const match = buttons.find((btn) => (btn.innerText || '').trim() === target);
+          if (match) {{
+            match.click();
+          }}
+        }};
+        clickTab();
+        setTimeout(clickTab, 120);
+        setTimeout(clickTab, 360);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def resolve_case_pdf_path(bib_pdf_dir: Path, source_pdf_name: str) -> Path | None:
+    if not source_pdf_name:
+        return None
+    candidate = bib_pdf_dir / source_pdf_name
+    return candidate if candidate.exists() else None
+
+
+def render_pdf_resource_popover(
+    *,
+    label: str,
+    pdf_path: Path | None,
+    section: str = "",
+    title: str = "",
+    snippet: str = "",
+    asset_path: str = "",
+    source_url: str = "",
+    key_hint: str = "",
+) -> None:
+    with st.popover(label):
+        if title:
+            st.markdown(f"**{title}**")
+        if section:
+            st.caption(f"Section: {section}")
+        if source_url:
+            st.link_button("Open source link", source_url, width="stretch")
+        if snippet:
+            st.markdown(clean_markdown_for_display(snippet[:1600]), unsafe_allow_html=True)
+        asset = Path(asset_path) if asset_path else None
+        if asset and asset.exists() and asset.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            st.image(str(asset), caption=asset.name, width="stretch")
+        elif asset and asset.exists():
+            st.caption(f"Linked artifact: `{asset.name}`")
+        elif asset_path:
+            st.caption(f"Linked artifact path: `{asset_path}`")
+        if pdf_path and pdf_path.exists():
+            try:
+                previews, page_total = render_pdf_preview(pdf_path, max_pages=3)
+                st.caption(f"PDF preview · {page_total} page(s)")
+                for page_number, preview in enumerate(previews, start=1):
+                    st.image(preview, caption=f"Page {page_number}", width="stretch")
+            except Exception as exc:
+                st.info("Inline PDF preview is unavailable for this evidence item. Use the download action below.")
+                with st.expander("Preview diagnostic", expanded=False):
+                    st.code(str(exc), language="text")
+            st.download_button(
+                "Download PDF",
+                data=pdf_path.read_bytes(),
+                file_name=pdf_path.name,
+                mime="application/pdf",
+                key=f"download_pdf_{key_hint}_{pdf_path.name}",
+                width="stretch",
+            )
+            st.caption(str(pdf_path))
+        else:
+            st.info("No local PDF preview is available for this evidence item.")
+
+
+def render_evidence_resources(
+    evidence_references: list[dict[str, Any]],
+    *,
+    bib_pdf_dir: Path,
+    key_prefix: str,
+    title: str = "Evidence resources",
+) -> None:
+    if not evidence_references:
+        return
+    st.markdown(f"#### {title}")
+    for item in evidence_references:
+        evidence_id = str(item.get("evidence_id") or f"E{item.get('index', '')}").strip()
+        source_pdf_name = str(item.get("source_pdf_name", "")).strip()
+        pdf_path = resolve_case_pdf_path(bib_pdf_dir, source_pdf_name)
+        display_label = evidence_id or source_pdf_name or "Evidence"
+        subtitle = item.get("section") or item.get("section_title") or item.get("title") or ""
+        row_cols = st.columns([0.24, 0.76], gap="small")
+        row_cols[0].markdown(f"**{display_label}**")
+        with row_cols[1]:
+            render_pdf_resource_popover(
+                label=f"View {display_label}",
+                pdf_path=pdf_path,
+                section=str(item.get("section") or item.get("section_title") or ""),
+                title=str(item.get("title") or item.get("paper_title") or source_pdf_name),
+                snippet=str(item.get("content") or ""),
+                asset_path=str(item.get("asset_path") or ""),
+                source_url=str(item.get("source_url") or ""),
+                key_hint=f"{key_prefix}_{display_label}",
+            )
+            if subtitle:
+                st.caption(f"{source_pdf_name} | {subtitle}")
+            elif source_pdf_name:
+                st.caption(source_pdf_name)
+
+
+def report_resource_links(report_text: str) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for url in extract_urls(report_text):
+        clean = normalize_url(url)
+        if clean and clean not in seen:
+            seen.add(clean)
+            urls.append(clean)
+    return urls
+
+
+def render_report_resource_explorer(report_text: str, bib_pdf_dir: Path, key_prefix: str) -> None:
+    pdfs = discover_pdfs(bib_pdf_dir)
+    urls = report_resource_links(report_text)
+    if not pdfs and not urls:
+        return
+    st.markdown("#### Evidence and source explorer")
+    if pdfs:
+        st.caption("Local PDFs")
+        local_cols = st.columns(3)
+        for index, pdf_path in enumerate(pdfs[:18]):
+            with local_cols[index % 3]:
+                render_pdf_resource_popover(
+                    label=f"Open {pdf_path.stem[:28]}",
+                    pdf_path=pdf_path,
+                    title=pdf_path.name,
+                    key_hint=f"{key_prefix}_pdf_{index}",
+                )
+    if urls:
+        st.caption("Verified source links")
+        for url in urls[:20]:
+            with st.popover(f"Source: {urlparse(url).netloc}"):
+                st.link_button("Open source", url, width="stretch")
+                st.code(url, language="text")
+
+
+def normalize_graph_artifacts(evidence_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for item in evidence_items:
+        node_type = str(item.get("node_type", "")).lower()
+        modality = "image" if node_type == "figure" else ("table" if node_type == "table" else node_type)
+        if modality not in {"image", "table"}:
+            continue
+        artifacts.append(
+            {
+                "index": item.get("evidence_id"),
+                "modality": modality,
+                "node_type": node_type,
+                "source_pdf_name": item.get("source_pdf_name"),
+                "asset_path": item.get("asset_path"),
+                "score": item.get("score"),
+                "title": item.get("section") or item.get("paper_title") or item.get("node_id"),
+                "section": item.get("section", ""),
+                "content": item.get("content", ""),
+            }
+        )
+    return artifacts
 
 
 def build_multimodal_evidence_bundle(evidence: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -873,6 +1153,39 @@ def multimodal_chat_answer(
         "evidence": evidence,
         "evidence_references": evidence_references,
         "artifact_references": artifact_references,
+    }
+
+
+def graph_chat_answer(
+    question: str,
+    settings: dict[str, Any],
+    graph_store_path: Path,
+) -> dict[str, Any]:
+    from scientific_graph_rag import run_query
+
+    backend = "ollama" if settings.get("backend") == "Local Ollama" else "cloud"
+    cloud_provider = "deepseek" if settings.get("cloud_provider") == "DeepSeek" else "openai"
+    response = run_query(
+        question=question,
+        graph_store=graph_store_path,
+        backend=backend,
+        model=str(settings.get("model", "")).strip(),
+        ollama_base_url=settings.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL),
+        cloud_provider=cloud_provider,
+        api_key=settings.get("api_key", "").strip(),
+        base_url=settings.get("openai_base_url", "").strip(),
+        max_queries=4,
+        top_k_per_query=max(6, int(settings.get("multimodal_retrieval_limit", 10))),
+    )
+    artifacts = normalize_graph_artifacts(response.get("evidence_items", []))
+    return {
+        "answer": response.get("answer_markdown", "").strip(),
+        "answer_markdown": response.get("answer_markdown", "").strip(),
+        "evidence": response.get("evidence_items", []),
+        "evidence_references": response.get("evidence_items", []),
+        "artifact_references": artifacts,
+        "query_plan": response.get("query_plan", []),
+        "synthesis_error": response.get("synthesis_error", ""),
     }
 
 
@@ -1281,21 +1594,105 @@ def clean_latex_response(text: str) -> str:
     return clean.strip() + "\n"
 
 
-def modify_latex_source(current_source: str, instruction: str, settings: dict[str, Any]) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a careful LaTeX co-author. Return only the complete raw LaTeX source. "
-                "Do not include markdown fences, explanations, or commentary. Preserve packages and compilability."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Instruction:\n{instruction}\n\nCurrent LaTeX source:\n{current_source}",
-        },
+def structurally_validate_latex(source: str) -> str | None:
+    required_tokens = [
+        "\\documentclass",
+        "\\begin{document}",
+        "\\end{document}",
     ]
-    return clean_latex_response(llm_complete(messages, settings))
+    for token in required_tokens:
+        if token not in source:
+            return f"Missing required LaTeX token: {token}"
+    if source.find("\\begin{document}") > source.find("\\end{document}"):
+        return "The document body markers are out of order."
+    return None
+
+
+def validate_latex_candidate(candidate_source: str, paths: RuntimePaths) -> tuple[bool, str]:
+    structural_issue = structurally_validate_latex(candidate_source)
+    if structural_issue:
+        return False, structural_issue
+
+    if shutil.which("pdflatex") is None:
+        return True, "pdflatex not available; structural validation only."
+
+    temp_name = f".{paths.paper_tex.stem}.ai_validation.tex"
+    temp_source_path = paths.paper_tex.parent / temp_name
+    output_dir_path: Path | None = None
+    try:
+        atomic_write_text(temp_source_path, candidate_source)
+        with tempfile.TemporaryDirectory(prefix="latex-validate-") as tmpdir:
+            output_dir_path = Path(tmpdir)
+            command = [
+                "pdflatex",
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                f"-output-directory={tmpdir}",
+                temp_name,
+            ]
+            result = subprocess.run(
+                command,
+                cwd=str(paths.paper_tex.parent),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            if result.returncode != 0:
+                log = (result.stdout or "") + "\n" + (result.stderr or "")
+                return False, log.strip()[-4000:]
+            return True, "Validation compile succeeded."
+    except subprocess.TimeoutExpired as exc:
+        return False, f"LaTeX validation timed out: {exc}"
+    finally:
+        try:
+            temp_source_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if output_dir_path is not None:
+            for suffix in (".aux", ".log", ".out", ".pdf", ".toc"):
+                try:
+                    (output_dir_path / f"{Path(temp_name).stem}{suffix}").unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def modify_latex_source(current_source: str, instruction: str, settings: dict[str, Any], paths: RuntimePaths) -> str:
+    system_prompt = (
+        "You are a careful LaTeX co-author working on a scientific paper. "
+        "You must read the entire source before editing it. "
+        "Apply the user request directly to the provided source and return only one complete compilable LaTeX document, "
+        "from \\documentclass through \\end{document}. "
+        "Do not omit sections, packages, macros, bibliography commands, labels, or environments unless the user explicitly asks for removal. "
+        "Keep indentation tidy, preserve existing structure where possible, and never add markdown fences or explanations."
+    )
+    validation_feedback = ""
+    for attempt in range(1, 3):
+        user_prompt = (
+            f"User modification request:\n{instruction}\n\n"
+            "Current full LaTeX source to edit:\n"
+            f"{current_source}"
+        )
+        if validation_feedback:
+            user_prompt += (
+                "\n\nThe previous LaTeX candidate failed validation. "
+                "Repair it and return a corrected full document only.\n"
+                f"Validation feedback:\n{validation_feedback}"
+            )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        candidate = clean_latex_response(llm_complete(messages, settings))
+        is_valid, feedback = validate_latex_candidate(candidate, paths)
+        if is_valid:
+            return candidate
+        validation_feedback = feedback
+
+    raise RuntimeError(
+        "The model returned LaTeX that failed validation twice.\n\n"
+        f"Validation feedback:\n{validation_feedback}"
+    )
 
 
 def compile_latex(paths: RuntimePaths) -> dict[str, Any]:
@@ -1356,6 +1753,234 @@ def safe_toast(message: str) -> None:
         st.toast(message)
     except Exception:
         st.success(message)
+
+
+def read_json_file(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def sync_chat_session_from_db(database_path: Path, case_id: int) -> None:
+    st.session_state["chat_messages"] = load_case_chat_messages(database_path, case_id)
+    st.session_state["chat_pending_question"] = ""
+    st.session_state["chat_pending_mode"] = "standard"
+    st.session_state["active_case_id"] = case_id
+
+
+def maybe_auto_sync_case(database_path: Path, case_record: Any) -> tuple[bool, str]:
+    if not minio_is_configured():
+        return False, ""
+    try:
+        sync_case_to_minio(database_path, case_record)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def case_report_rows(case_record: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in list_saved_reports(case_paths(case_record)["bib_pdf"]):
+        rows.append(
+            {
+                "report": path.name,
+                "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "chars": path.stat().st_size,
+            }
+        )
+    return rows
+
+
+def case_graph_rows(case_record: Any) -> list[dict[str, Any]]:
+    graph_root = case_paths(case_record)["graph_store"] / "manifests"
+    rows: list[dict[str, Any]] = []
+    for path in sorted(graph_root.glob("*.json")) if graph_root.exists() else []:
+        payload = read_json_file(path, {})
+        rows.append(
+            {
+                "paper": payload.get("source_pdf_name") or payload.get("doc_id") or path.stem,
+                "doc_id": payload.get("doc_id", path.stem),
+                "status": payload.get("status", ""),
+                "indexed_at": payload.get("indexed_at", ""),
+            }
+        )
+    return rows
+
+
+def case_latex_rows(case_record: Any) -> list[dict[str, Any]]:
+    paths = case_paths(case_record)
+    rows: list[dict[str, Any]] = []
+    paper_path = paths["paper_tex"]
+    if paper_path.exists():
+        rows.append(
+            {
+                "artifact": paper_path.name,
+                "type": "source",
+                "modified": datetime.fromtimestamp(paper_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+    compiled_root = paths["compiled_output"]
+    if compiled_root.exists():
+        for pdf_path in sorted(compiled_root.glob("*.pdf")):
+            rows.append(
+                {
+                    "artifact": pdf_path.name,
+                    "type": "compiled_pdf",
+                    "modified": datetime.fromtimestamp(pdf_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                }
+            )
+    return rows
+
+
+def render_login_screen() -> None:
+    _, center, _ = st.columns([0.22, 0.56, 0.22])
+    with center:
+        st.title("Research Copilot")
+        st.subheader("Sign in")
+        st.caption("Use the demo credentials to enter the research workspace.")
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", value="")
+            password = st.text_input("Password", value="", type="password")
+            submitted = st.form_submit_button("Login", type="primary", width="stretch")
+        if submitted:
+            if username == "admin" and password == "admin":
+                st.session_state["is_authenticated"] = True
+                st.session_state["auth_user"] = "admin"
+                st.session_state.setdefault("app_view", "home")
+                st.rerun()
+            st.error("Invalid credentials. Use `admin` / `admin`.")
+    st.stop()
+
+
+def render_home_page(database_path: Path, selected_case: Any, all_cases: list[Any]) -> None:
+    selected_paths = case_paths(selected_case)
+    staged_pdfs = discover_pdfs(selected_paths["bib_pdf"])
+    report_rows = case_report_rows(selected_case)
+    graph_rows = case_graph_rows(selected_case)
+    latex_rows = case_latex_rows(selected_case)
+    sync_event = latest_sync_event(database_path, selected_case.id)
+
+    st.title("Welcome")
+    st.write(
+        "This home space gives you a stable entry point into the research workspace, the legacy artifacts already in the repo, "
+        "and the new case-management layer for fresh studies."
+    )
+
+    action_cols = st.columns([0.34, 0.33, 0.33])
+    if action_cols[0].button("Open Deep Search Workspace", type="primary", width="stretch"):
+        st.session_state["app_view"] = "workspace"
+        st.rerun()
+    if action_cols[1].button("Create New Case", width="stretch"):
+        st.session_state["app_view"] = "new_case"
+        st.rerun()
+    if action_cols[2].button("Sync Current Case To MinIO", width="stretch"):
+        with st.spinner("Syncing case artifacts to MinIO..."):
+            try:
+                result = sync_case_to_minio(database_path, selected_case)
+                safe_toast(f"Synced {result['uploaded']} objects to MinIO")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"MinIO sync failed: {exc}")
+
+    metrics = st.columns(5)
+    metrics[0].metric("Cases", len(all_cases))
+    metrics[1].metric("Staged PDFs", len(staged_pdfs))
+    metrics[2].metric("Reports", len(report_rows))
+    metrics[3].metric("Graph docs", len(graph_rows))
+    metrics[4].metric("LaTeX artifacts", len(latex_rows))
+
+    with st.container(border=True):
+        st.markdown(f"### Active Case: {selected_case.name}")
+        if selected_case.description:
+            st.write(selected_case.description)
+        if selected_case.research_goal:
+            st.caption(f"Research goal: {selected_case.research_goal}")
+        if sync_event:
+            st.caption(
+                f"Last MinIO sync: {sync_event.get('created_at')} | {sync_event.get('status')} | "
+                f"{sync_event.get('artifact_count')} objects"
+            )
+
+    with st.expander("Edit case details", expanded=False):
+        with st.form("edit_case_details"):
+            edited_name = st.text_input("Case name", value=selected_case.name)
+            edited_description = st.text_area("Description", value=selected_case.description, height=100)
+            edited_goal = st.text_area("Research goal", value=selected_case.research_goal, height=90)
+            if st.form_submit_button("Save case details", type="primary", width="stretch"):
+                update_case_metadata(
+                    database_path,
+                    selected_case.id,
+                    name=edited_name,
+                    description=edited_description,
+                    research_goal=edited_goal,
+                )
+                safe_toast("Case details updated")
+                st.rerun()
+
+    preview_left, preview_right = st.columns([1, 1], gap="large")
+    with preview_left:
+        st.markdown("### Legacy Reports")
+        if report_rows:
+            st.dataframe(report_rows, width="stretch", hide_index=True)
+        else:
+            st.info("No deep-search reports found for this case.")
+
+        st.markdown("### LaTeX Representations")
+        if latex_rows:
+            st.dataframe(latex_rows, width="stretch", hide_index=True)
+        else:
+            st.info("No LaTeX source or compiled PDF was found for this case.")
+
+    with preview_right:
+        st.markdown("### Graph Artifacts")
+        if graph_rows:
+            st.dataframe(graph_rows, width="stretch", hide_index=True)
+        else:
+            st.info("No graph knowledge-store manifests were found for this case.")
+
+        st.markdown("### Case Paths")
+        st.code(
+            "\n".join(
+                [
+                    f"root: {selected_paths['root']}",
+                    f"bib_pdf: {selected_paths['bib_pdf']}",
+                    f"multimodal_store: {selected_paths['multimodal_store']}",
+                    f"graph_store: {selected_paths['graph_store']}",
+                    f"compiled_output: {selected_paths['compiled_output']}",
+                    f"paper_tex: {selected_paths['paper_tex']}",
+                ]
+            ),
+            language="text",
+        )
+
+
+def render_new_case_page(database_path: Path, root: Path) -> None:
+    st.title("Create A New Case")
+    st.write("Each case gets its own PDF staging area, multimodal index store, graph store, compile output, and LaTeX source.")
+
+    with st.form("new_case_form"):
+        case_name = st.text_input("Case name", value="")
+        case_description = st.text_area("Description", height=110)
+        case_goal = st.text_area("Research goal", height=110)
+        submitted = st.form_submit_button("Create case", type="primary", width="stretch")
+
+    if submitted:
+        if not case_name.strip():
+            st.warning("Add a case name first.")
+        else:
+            new_case = create_managed_case(
+                database_path,
+                root=root,
+                name=case_name.strip(),
+                description=case_description.strip(),
+                research_goal=case_goal.strip(),
+            )
+            st.session_state["selected_case_slug"] = new_case.slug
+            st.session_state["app_view"] = "workspace"
+            sync_chat_session_from_db(database_path, new_case.id)
+            safe_toast(f"Created case: {new_case.name}")
+            st.rerun()
 
 
 def missing_runtime_modules(settings: dict[str, Any]) -> list[str]:
@@ -1506,16 +2131,122 @@ st.markdown(
         padding-bottom: 0.2rem;
         border-top: 1px solid rgba(128, 128, 128, 0.18);
     }
+    .st-key-multimodal_chat_input textarea {
+        padding-right: 14.5rem !important;
+    }
+    .st-key-chat_mode_selector_inline {
+        position: relative;
+        z-index: 45;
+        margin-top: -4.0rem;
+        margin-bottom: 0.2rem;
+        height: 0;
+        pointer-events: none;
+        display: flex !important;
+        justify-content: flex-end;
+    }
+    .st-key-chat_mode_selector_inline > div {
+        pointer-events: auto;
+        display: block !important;
+        background: rgba(20, 22, 30, 0.92);
+        border: 1px solid rgba(128, 128, 128, 0.22);
+        border-radius: 999px;
+        padding: 0.18rem 0.25rem;
+        margin-right: 4.25rem !important;
+        width: fit-content !important;
+        max-width: fit-content;
+        transform: translateY(0.12rem);
+    }
+    .st-key-chat_mode_selector_inline [role="radiogroup"] {
+        gap: 0.2rem;
+        flex-wrap: nowrap !important;
+        justify-content: flex-end !important;
+    }
+    .st-key-chat_mode_selector_inline label {
+        margin-bottom: 0 !important;
+    }
+    .st-key-chat_mode_selector_inline p {
+        font-size: 0.78rem !important;
+        margin: 0 !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+APP_DB_PATH = resolve_workspace_path(os.getenv("APP_DB_PATH", str(case_db_path(ROOT))))
+init_case_db(APP_DB_PATH)
+legacy_case = ensure_legacy_case(APP_DB_PATH, ROOT, DEFAULT_TITLE)
+
+if not st.session_state.get("is_authenticated"):
+    render_login_screen()
+
+all_cases = list_managed_cases(APP_DB_PATH)
+case_lookup = {case.slug: case for case in all_cases}
+if not all_cases:
+    fallback_case = create_managed_case(
+        APP_DB_PATH,
+        root=ROOT,
+        name="Default Study",
+        description="Auto-created workspace because no study existed yet.",
+        research_goal="Start a new case-managed study.",
+    )
+    all_cases = list_managed_cases(APP_DB_PATH)
+    case_lookup = {case.slug: case for case in all_cases}
+else:
+    fallback_case = all_cases[0]
+if "selected_case_slug" not in st.session_state or st.session_state.get("selected_case_slug") not in case_lookup:
+    st.session_state["selected_case_slug"] = (legacy_case.slug if legacy_case else fallback_case.slug)
+
+selected_case = case_lookup.get(st.session_state["selected_case_slug"]) or fallback_case
+if st.session_state.get("active_case_id") != selected_case.id:
+    sync_chat_session_from_db(APP_DB_PATH, selected_case.id)
+
+if "app_view" not in st.session_state:
+    st.session_state["app_view"] = "home"
+
 
 with st.sidebar:
     st.title("Research Copilot")
-    workspace_title = st.text_input("Workspace title", value=st.session_state.get("workspace_title", DEFAULT_TITLE))
-    st.session_state["workspace_title"] = workspace_title
+    st.caption(f"Signed in as `{st.session_state.get('auth_user', 'admin')}`")
+    top_sidebar_cols = st.columns(2)
+    if top_sidebar_cols[0].button("Home", width="stretch"):
+        st.session_state["app_view"] = "home"
+        st.rerun()
+    if top_sidebar_cols[1].button("Logout", width="stretch"):
+        st.session_state.clear()
+        st.rerun()
+
+    case_options = [(case.slug, f"{case.name}{' (legacy)' if case.is_legacy else ''}") for case in all_cases]
+    selected_case_choice = st.selectbox(
+        "Active case",
+        case_options,
+        index=next((index for index, item in enumerate(case_options) if item[0] == selected_case.slug), 0),
+        format_func=lambda item: item[1],
+    )
+    if selected_case_choice[0] != selected_case.slug:
+        st.session_state["selected_case_slug"] = selected_case_choice[0]
+        st.rerun()
+    selected_case = get_case_by_slug(APP_DB_PATH, selected_case_choice[0]) or selected_case
+
+    nav_choice = st.radio(
+        "Navigation",
+        [("home", "Home"), ("workspace", "Research Workspace"), ("new_case", "New Case")],
+        index=0 if st.session_state.get("app_view", "home") == "home" else (1 if st.session_state.get("app_view") == "workspace" else 2),
+        format_func=lambda item: item[1],
+    )
+    st.session_state["app_view"] = nav_choice[0]
+
+    workspace_title = st.text_input("Workspace title", value=selected_case.name)
+    if workspace_title.strip() and workspace_title.strip() != selected_case.name:
+        selected_case = update_case_metadata(
+            APP_DB_PATH,
+            selected_case.id,
+            name=workspace_title.strip(),
+            description=selected_case.description,
+            research_goal=selected_case.research_goal,
+        ) or selected_case
+        st.session_state["selected_case_slug"] = selected_case.slug
+    st.session_state["workspace_title"] = workspace_title.strip() or selected_case.name
 
     backend = st.selectbox("LLM backend", ["Local Ollama", "Cloud API"], index=0)
     cloud_provider = "OpenAI"
@@ -1675,10 +2406,19 @@ with st.sidebar:
             st.caption("OpenAI-compatible cloud calls use temperature, top-p, max tokens, and reasoning effort where the model supports them.")
 
     with st.expander("Workspace paths", expanded=False):
-        bib_pdf_raw = st.text_input("PDF staging directory", value=os.getenv("BIB_PDF_DIR", "./bib_pdf"))
-        multimodal_store_raw = st.text_input("Multimodal store directory", value=os.getenv("MULTIMODAL_STORE_DIR", "./multimodal_store"))
-        compiled_output_raw = st.text_input("Compile output directory", value=os.getenv("COMPILED_OUTPUT_DIR", "./compiled_output"))
-        paper_tex_raw = st.text_input("LaTeX source path", value=os.getenv("PAPER_TEX_PATH", "./paper.tex"))
+        managed_paths = case_paths(selected_case)
+        bib_pdf_raw = st.text_input("PDF staging directory", value=str(managed_paths["bib_pdf"]), disabled=True)
+        multimodal_store_raw = st.text_input("Multimodal store directory", value=str(managed_paths["multimodal_store"]), disabled=True)
+        graph_store_raw = st.text_input("Graph store directory", value=str(managed_paths["graph_store"]), disabled=True)
+        compiled_output_raw = st.text_input("Compile output directory", value=str(managed_paths["compiled_output"]), disabled=True)
+        paper_tex_raw = st.text_input("LaTeX source path", value=str(managed_paths["paper_tex"]), disabled=True)
+        if st.button("Sync Current Case To MinIO", width="stretch"):
+            with st.spinner("Uploading this case to MinIO..."):
+                try:
+                    sync_result = sync_case_to_minio(APP_DB_PATH, selected_case)
+                    safe_toast(f"Synced {sync_result['uploaded']} objects to MinIO")
+                except Exception as exc:
+                    st.error(f"MinIO sync failed: {exc}")
 
 settings = {
     "backend": backend,
@@ -1734,14 +2474,22 @@ paths = RuntimePaths(
     paper_tex=resolve_workspace_path(paper_tex_raw),
 )
 multimodal_store_path = resolve_workspace_path(multimodal_store_raw)
+graph_store_path = resolve_workspace_path(graph_store_raw)
 created_paper = ensure_bootstrap_files(paths, workspace_title)
 sync_latex_session(paths.paper_tex)
 missing_modules = missing_runtime_modules(settings)
 
+if st.session_state.get("app_view") == "home":
+    render_home_page(APP_DB_PATH, selected_case, all_cases)
+    st.stop()
+if st.session_state.get("app_view") == "new_case":
+    render_new_case_page(APP_DB_PATH, ROOT)
+    st.stop()
+
 st.title(workspace_title)
 st.caption(f"Active model: {settings['backend']} / {settings['model']} | Paper: {paths.paper_tex.relative_to(ROOT) if paths.paper_tex.is_relative_to(ROOT) else paths.paper_tex}")
 st.caption(
-    f"Engines: GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | Multimodal store `{multimodal_store_path}` | Retriever `{effective_retriever(settings)}`"
+    f"Case `{selected_case.slug}` | GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | Multimodal store `{multimodal_store_path}` | Retriever `{effective_retriever(settings)}`"
 )
 if created_paper:
     safe_toast(f"Initialized {paths.paper_tex.name}")
@@ -1759,10 +2507,10 @@ tab_search, tab_chat, tab_latex = st.tabs(
         "Live LaTeX Studio & Local Compiling",
     ]
 )
+maybe_switch_workspace_tab()
 
 
 with tab_search:
-    left, right = st.columns([0.95, 1.05], gap="large")
     if "selected_report_path" not in st.session_state:
         st.session_state["selected_report_path"] = ""
     if "research_plan_text" not in st.session_state:
@@ -1773,250 +2521,153 @@ with tab_search:
         st.session_state["research_plan_items"] = []
     if "research_plan_source" not in st.session_state:
         st.session_state["research_plan_source"] = {}
-    with left:
-        st.subheader("Agentic Discovery")
-        default_query = (
-            f"Find primary literature, datasets, benchmark studies, and repositories relevant to {workspace_title}. "
-            "Prioritize PDFs, scholarly sources, and reproducible methods."
-        )
-        query = st.text_area("Deep search query", value=default_query, height=170)
-        report_type = st.selectbox(
-            "Report type",
-            ["research_report", "detailed_report", "deep", "custom_report"],
-            index=["research_report", "detailed_report", "deep", "custom_report"].index(os.getenv("GPT_RESEARCHER_REPORT_TYPE", "research_report"))
-            if os.getenv("GPT_RESEARCHER_REPORT_TYPE", "research_report") in ["research_report", "detailed_report", "deep", "custom_report"]
-            else 0,
-        )
-        plan_key = {
-            "query": query.strip(),
-            "report_type": report_type,
-            "retriever": effective_retriever(settings),
-            "max_results": settings["max_search_results_per_query"],
-            "breadth": settings["deep_research_breadth"],
-        }
-        if st.button("Generate Research Plan", type="primary", width="stretch"):
-            if not query.strip():
-                st.warning("Enter a query before planning the researcher.")
-            else:
-                progress_box = st.empty()
-                capture = None
-                handler = StreamlitResearchLogHandler(progress_box=progress_box)
+
+    st.subheader("Agentic Discovery")
+    default_query = (
+        f"Find primary literature, datasets, benchmark studies, and repositories relevant to {workspace_title}. "
+        "Prioritize PDFs, scholarly sources, and reproducible methods."
+    )
+    query = st.text_area("Deep search query", value=default_query, height=170)
+    report_type = st.selectbox(
+        "Report type",
+        ["research_report", "detailed_report", "deep", "custom_report"],
+        index=["research_report", "detailed_report", "deep", "custom_report"].index(os.getenv("GPT_RESEARCHER_REPORT_TYPE", "research_report"))
+        if os.getenv("GPT_RESEARCHER_REPORT_TYPE", "research_report") in ["research_report", "detailed_report", "deep", "custom_report"]
+        else 0,
+    )
+    plan_key = {
+        "query": query.strip(),
+        "report_type": report_type,
+        "retriever": effective_retriever(settings),
+        "max_results": settings["max_search_results_per_query"],
+        "breadth": settings["deep_research_breadth"],
+    }
+    if st.button("Generate Research Plan", type="primary", width="stretch"):
+        preflight_issues = runtime_preflight(settings, paths)
+        if preflight_issues:
+            st.error("\n".join(f"- {issue}" for issue in preflight_issues))
+        elif not query.strip():
+            st.warning("Enter a query before planning the researcher.")
+        else:
+            progress_box = st.empty()
+            capture = None
+            handler = StreamlitResearchLogHandler(progress_box=progress_box)
+            try:
+                handler._stage("Preparing planner", "Initializing model, retriever, and scientific search skills.")
+                capture = StreamlitLoggingCaptureHandler(handler)
+                logging.getLogger("research").addHandler(capture)
+                logging.getLogger("gpt_researcher").addHandler(capture)
+                plan_items = run_async(generate_research_plan(query.strip(), report_type, settings, log_handler=handler))
+                if capture:
+                    logging.getLogger("research").removeHandler(capture)
+                    logging.getLogger("gpt_researcher").removeHandler(capture)
+                set_research_plan_items(plan_items, plan_key)
+                handler._finish("Research plan ready", f"{len(plan_items)} planned search directions.")
+                safe_toast("Research plan generated")
+            except Exception as exc:
                 try:
-                    handler._stage("Preparing planner", "Initializing model, retriever, and scientific search skills.")
-                    capture = StreamlitLoggingCaptureHandler(handler)
-                    logging.getLogger("research").addHandler(capture)
-                    logging.getLogger("gpt_researcher").addHandler(capture)
-                    plan_items = run_async(generate_research_plan(query.strip(), report_type, settings, log_handler=handler))
                     if capture:
                         logging.getLogger("research").removeHandler(capture)
                         logging.getLogger("gpt_researcher").removeHandler(capture)
-                    set_research_plan_items(plan_items, plan_key)
-                    handler._finish("Research plan ready", f"{len(plan_items)} planned search directions.")
-                    safe_toast("Research plan generated")
-                except Exception as exc:
+                except Exception:
+                    pass
+                handler._fail(str(exc)[:180])
+                st.error("Research planning failed.")
+                st.code(str(exc), language="text")
+
+    if st.session_state.get("research_plan_items"):
+        if st.session_state.get("research_plan_source") != plan_key:
+            st.warning("This plan was generated for different query/settings. Regenerate it or review edits carefully.")
+        title_cols = st.columns([0.88, 0.12])
+        title_cols[0].markdown("#### Planned Research Queries")
+        title_cols[1].button("i", help=PLAN_HELP_TEXT, width="stretch")
+        st.caption("Edit rows directly. Changes are applied when a field loses focus or the page reruns.")
+
+        for index, item in enumerate(st.session_state.get("research_plan_items", [])):
+            query_key = f"plan_query_{index}"
+            goal_key = f"plan_goal_{index}"
+            if query_key not in st.session_state:
+                st.session_state[query_key] = item.get("query", "")
+            if goal_key not in st.session_state:
+                st.session_state[goal_key] = item.get("researchGoal", "") or infer_plan_goal(item.get("query", ""))
+            with st.container(border=True):
+                st.markdown(f"**Search direction {index + 1}**")
+                st.text_input(
+                    "Query",
+                    key=query_key,
+                    placeholder='"patent classification" "sustainable development goals" dataset',
+                    help="Exact retriever query. Keep concise; Tavily rejects queries over 400 characters.",
+                )
+                st.text_input(
+                    "Goal",
+                    key=goal_key,
+                    placeholder="Find datasets, benchmarks, or primary papers for this query.",
+                    help="Purpose of this query. If left blank, the app fills a sensible default from the query terms.",
+                )
+        planned_queries = sync_plan_from_row_widgets()
+        run_col, clear_col = st.columns([0.72, 0.28])
+        with run_col:
+            if st.button("Start Research with Approved Plan", type="primary", width="stretch"):
+                preflight_issues = runtime_preflight(settings, paths)
+                if preflight_issues:
+                    st.error("\n".join(f"- {issue}" for issue in preflight_issues))
+                elif not planned_queries:
+                    st.warning("Keep at least one planned query before starting research.")
+                else:
+                    progress_box = st.empty()
+                    capture = None
+                    handler = StreamlitResearchLogHandler(progress_box=progress_box)
                     try:
+                        handler._stage("Preparing Deep Search", "Starting from the user-approved research plan.")
+                        capture = StreamlitLoggingCaptureHandler(handler)
+                        logging.getLogger("research").addHandler(capture)
+                        logging.getLogger("gpt_researcher").addHandler(capture)
+                        result = run_async(
+                            run_gpt_researcher(
+                                query.strip(),
+                                report_type,
+                                settings,
+                                paths,
+                                log_handler=handler,
+                                planned_queries=planned_queries,
+                            )
+                        )
                         if capture:
                             logging.getLogger("research").removeHandler(capture)
                             logging.getLogger("gpt_researcher").removeHandler(capture)
-                    except Exception:
-                        pass
-                    handler._fail(str(exc)[:180])
-                    st.error("Research planning failed.")
-                    st.code(str(exc), language="text")
-
-        if st.session_state.get("research_plan_items"):
-            if st.session_state.get("research_plan_source") != plan_key:
-                st.warning("This plan was generated for different query/settings. Regenerate it or review edits carefully.")
-            title_cols = st.columns([0.88, 0.12])
-            title_cols[0].markdown("#### Planned Research Queries")
-            title_cols[1].button("i", help=PLAN_HELP_TEXT, width="stretch")
-            st.caption("Edit rows directly. Changes are applied when a field loses focus or the page reruns.")
-
-            for index, item in enumerate(st.session_state.get("research_plan_items", [])):
-                query_key = f"plan_query_{index}"
-                goal_key = f"plan_goal_{index}"
-                if query_key not in st.session_state:
-                    st.session_state[query_key] = item.get("query", "")
-                if goal_key not in st.session_state:
-                    st.session_state[goal_key] = item.get("researchGoal", "") or infer_plan_goal(item.get("query", ""))
-                with st.container(border=True):
-                    st.markdown(f"**Search direction {index + 1}**")
-                    st.text_input(
-                        "Query",
-                        key=query_key,
-                        placeholder='"patent classification" "sustainable development goals" dataset',
-                        help="Exact retriever query. Keep concise; Tavily rejects queries over 400 characters.",
-                    )
-                    st.text_input(
-                        "Goal",
-                        key=goal_key,
-                        placeholder="Find datasets, benchmarks, or primary papers for this query.",
-                        help="Purpose of this query. If left blank, the app fills a sensible default from the query terms.",
-                    )
-            planned_queries = sync_plan_from_row_widgets()
-            run_col, clear_col = st.columns([0.72, 0.28])
-            with run_col:
-                if st.button("Start Research with Approved Plan", type="primary", width="stretch"):
-                    if not planned_queries:
-                        st.warning("Keep at least one planned query before starting research.")
-                    else:
-                        progress_box = st.empty()
-                        capture = None
-                        handler = StreamlitResearchLogHandler(progress_box=progress_box)
-                        try:
-                            handler._stage("Preparing Deep Search", "Starting from the user-approved research plan.")
-                            capture = StreamlitLoggingCaptureHandler(handler)
-                            logging.getLogger("research").addHandler(capture)
-                            logging.getLogger("gpt_researcher").addHandler(capture)
-                            result = run_async(
-                                run_gpt_researcher(
-                                    query.strip(),
-                                    report_type,
-                                    settings,
-                                    paths,
-                                    log_handler=handler,
-                                    planned_queries=planned_queries,
-                                )
+                        handler._stage("Saving report and acquired PDFs", "Writing markdown report and downloading discovered PDFs when available.")
+                        handler._finish("Deep Search complete", f"Saved report: {Path(result['report_path']).name}")
+                        safe_toast("Deep literature search complete")
+                        st.success(f"Report saved to {result['report_path']}")
+                        st.session_state["selected_report_path"] = str(result["report_path"])
+                        st.session_state["last_deep_search_report"] = result.get("report", "")
+                        st.write(f"Discovered URLs scanned for PDFs: {result['url_count']}")
+                        st.write(f"Verified reachable source links: {result['verified_url_count']}")
+                        synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
+                        if sync_error:
+                            st.warning(f"MinIO sync skipped after deep search: {sync_error}")
+                        elif synced:
+                            st.caption("MinIO sync completed for the updated case artifacts.")
+                        if result["downloaded"]:
+                            st.write("Downloaded PDFs")
+                            st.dataframe(
+                                [{"file": path.name, "path": str(path)} for path in result["downloaded"]],
+                                width="stretch",
                             )
+                    except Exception as exc:
+                        try:
                             if capture:
                                 logging.getLogger("research").removeHandler(capture)
                                 logging.getLogger("gpt_researcher").removeHandler(capture)
-                            handler._stage("Saving report and acquired PDFs", "Writing markdown report and downloading discovered PDFs when available.")
-                            handler._finish("Deep Search complete", f"Saved report: {Path(result['report_path']).name}")
-                            safe_toast("Deep literature search complete")
-                            st.success(f"Report saved to {result['report_path']}")
-                            st.session_state["selected_report_path"] = str(result["report_path"])
-                            st.session_state["last_deep_search_report"] = result.get("report", "")
-                            st.write(f"Discovered URLs scanned for PDFs: {result['url_count']}")
-                            st.write(f"Verified reachable source links: {result['verified_url_count']}")
-                            if result["downloaded"]:
-                                st.write("Downloaded PDFs")
-                                st.dataframe(
-                                    [{"file": path.name, "path": str(path)} for path in result["downloaded"]],
-                                    width="stretch",
-                                )
-                        except Exception as exc:
-                            try:
-                                if capture:
-                                    logging.getLogger("research").removeHandler(capture)
-                                    logging.getLogger("gpt_researcher").removeHandler(capture)
-                            except Exception:
-                                pass
-                            handler._fail(str(exc)[:180])
-                            st.error("Deep Search failed.")
-                            st.code(str(exc), language="text")
-            with clear_col:
-                st.button("Clear Plan", width="stretch", on_click=clear_research_plan_state)
-            st.button("Add Query Row", width="stretch", on_click=append_blank_plan_item)
+                        except Exception:
+                            pass
+                        handler._fail(str(exc)[:180])
+                        st.error("Deep Search failed.")
+                        st.code(str(exc), language="text")
+        with clear_col:
+            st.button("Clear Plan", width="stretch", on_click=clear_research_plan_state)
+        st.button("Add Query Row", width="stretch", on_click=append_blank_plan_item)
 
-    with right:
-        st.subheader("Multimodal Staging Room")
-        try:
-            from multimodal_pipeline import clean_store, ingest_pdf, store_summary
-        except Exception as exc:
-            clean_store = None
-            ingest_pdf = None
-            store_summary = None
-            st.error("Multimodal pipeline is not available.")
-            st.code(str(exc), language="text")
-
-        pdfs = discover_pdfs(paths.bib_pdf)
-        multimodal_summary = store_summary(multimodal_store_path) if store_summary else {
-            "documents": 0,
-            "text_chunks": 0,
-            "tables": 0,
-            "images": 0,
-            "vector_records": 0,
-        }
-        metrics = st.columns(3)
-        metrics[0].metric("Staged PDFs", len(pdfs))
-        metrics[1].metric("Indexed docs", multimodal_summary.get("documents", 0))
-        metrics[2].metric("Vector records", multimodal_summary.get("vector_records", 0))
-        artifact_metrics = st.columns(3)
-        artifact_metrics[0].metric("Text chunks", multimodal_summary.get("text_chunks", 0))
-        artifact_metrics[1].metric("Tables", multimodal_summary.get("tables", 0))
-        artifact_metrics[2].metric("Images", multimodal_summary.get("images", 0))
-        st.caption(f"Store: `{multimodal_store_path}`")
-
-        if pdfs:
-            st.dataframe(
-                [
-                    {
-                        "file": pdf.name,
-                        "MB": round(pdf.stat().st_size / (1024 * 1024), 2),
-                        "modified": datetime.fromtimestamp(pdf.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                    }
-                    for pdf in pdfs
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.info(f"No PDFs found in {paths.bib_pdf}")
-
-        index_col, reset_col = st.columns([0.7, 0.3])
-        if index_col.button("🔄 Index Workspace With MinerU + Multimodal RAG", type="primary", width="stretch"):
-            if not pdfs:
-                st.warning("Add PDFs to the staging directory before indexing.")
-            elif ingest_pdf is None:
-                st.error("Multimodal pipeline is not available.")
-            else:
-                results: list[dict[str, Any]] = []
-                progress = st.progress(0)
-                with st.status("Preparing multimodal indexing...", expanded=True) as status:
-                    st.write(f"Found {len(pdfs)} staged PDF(s).")
-                    st.write(
-                        "Using MinerU parsing, Ollama vision captioning, fixed mpnet embeddings, and local Qdrant indexing."
-                    )
-                    for index, pdf_path in enumerate(pdfs, start=1):
-                        status.update(label=f"Indexing {index}/{len(pdfs)}: {pdf_path.name}", state="running")
-                        st.write(f"Parsing and enriching `{pdf_path.name}`...")
-                        try:
-                            result = ingest_pdf(
-                                pdf_path,
-                                store_root=multimodal_store_path,
-                                text_model=settings["multimodal_text_model"],
-                                image_model=settings["multimodal_image_model"],
-                                embed_model=settings["multimodal_embed_model"],
-                                ollama_base_url=settings["ollama_base_url"],
-                                use_mineru=True,
-                                mineru_backend=settings["mineru_backend"],
-                                mineru_method=settings["mineru_method"],
-                                mineru_lang=settings["mineru_lang"],
-                                mineru_timeout=int(settings["mineru_timeout"]),
-                                enrich_images=True,
-                                enrich_tables=True,
-                                index=True,
-                                force=True,
-                            )
-                            results.append(result)
-                            st.write(
-                                f"Indexed `{pdf_path.name}` with `{result.get('parser')}`: "
-                                f"{result.get('vector_records', 0)} vectors, {result.get('images', 0)} images."
-                            )
-                        except Exception as exc:
-                            results.append({"status": "error", "source_pdf": str(pdf_path), "error": str(exc)})
-                            st.write(f"Error indexing `{pdf_path.name}`: {exc}")
-                        progress.progress(index / len(pdfs))
-                    errors = [item for item in results if item.get("status") == "error"]
-                    if errors:
-                        status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
-                        st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
-                    else:
-                        status.update(label="Multimodal index is ready", state="complete")
-                        safe_toast("Multimodal RAG index ready")
-                        st.success(f"Indexed {len(results)} PDF(s) into `{multimodal_store_path}`.")
-                st.dataframe(summarize_multimodal_results(results), width="stretch", hide_index=True)
-
-        if reset_col.button("Reset Index", width="stretch"):
-            if clean_store is None:
-                st.error("Multimodal pipeline is not available.")
-            else:
-                clean_store(multimodal_store_path)
-                safe_toast("Multimodal index reset")
-                st.rerun()
-
-    # Full-width report viewer (persists across tab switches)
     st.divider()
     st.subheader("Research Reports")
     report_files = list_saved_reports(paths.bib_pdf)
@@ -2037,27 +2688,174 @@ with tab_search:
 
     if selected_path:
         report_text = read_text_file(Path(selected_path))
-        st.markdown(report_text)
+        render_markdown_block(report_text)
+        render_report_resource_explorer(report_text, paths.bib_pdf, "report_resources")
+        action_cols = st.columns([0.32, 0.68])
+        if action_cols[0].button("Move To Index Page", type="primary", width="stretch"):
+            request_workspace_tab_switch("Agentic Multimodal RAG Chat")
+            st.rerun()
     else:
         st.info("Run Deep Search to generate a report, or select an existing markdown report from the list.")
 
 
 with tab_chat:
-    st.subheader("Workspace Cross-Examination")
+    st.subheader("Agentic Multimodal RAG Chat")
     try:
-        from multimodal_pipeline import store_summary
+        from multimodal_pipeline import clean_store, ingest_pdf, store_summary
+        from scientific_graph_rag import build_all_graphs, clean_graph_store as clean_graph_store_runtime
 
         chat_store_summary = store_summary(multimodal_store_path)
     except Exception as exc:
+        clean_store = None
+        ingest_pdf = None
+        build_all_graphs = None
+        clean_graph_store_runtime = None
         chat_store_summary = {"documents": 0, "vector_records": 0, "images": 0, "tables": 0}
         st.error("Multimodal retrieval backend is not available.")
         st.code(str(exc), language="text")
 
-    metrics = st.columns(4)
-    metrics[0].metric("Indexed docs", chat_store_summary.get("documents", 0))
-    metrics[1].metric("Vector records", chat_store_summary.get("vector_records", 0))
-    metrics[2].metric("Images", chat_store_summary.get("images", 0))
-    metrics[3].metric("Tables", chat_store_summary.get("tables", 0))
+    graph_summary: dict[str, Any] = {"documents": 0}
+    try:
+        from scientific_graph_rag import load_graphs
+
+        graph_summary["documents"] = len(load_graphs(graph_store_path))
+    except Exception:
+        graph_summary["documents"] = 0
+
+    st.markdown("### Staging Room")
+    pdfs = discover_pdfs(paths.bib_pdf)
+    staging_metrics = st.columns(6)
+    staging_metrics[0].metric("Staged PDFs", len(pdfs))
+    staging_metrics[1].metric("Indexed docs", chat_store_summary.get("documents", 0))
+    staging_metrics[2].metric("Vector records", chat_store_summary.get("vector_records", 0))
+    staging_metrics[3].metric("Tables", chat_store_summary.get("tables", 0))
+    staging_metrics[4].metric("Images", chat_store_summary.get("images", 0))
+    staging_metrics[5].metric("Graph docs", graph_summary.get("documents", 0))
+    st.caption(f"Store: `{multimodal_store_path}` | Graph store: `{graph_store_path}`")
+
+    if pdfs:
+        st.dataframe(
+            [
+                {
+                    "file": pdf.name,
+                    "MB": round(pdf.stat().st_size / (1024 * 1024), 2),
+                    "modified": datetime.fromtimestamp(pdf.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                }
+                for pdf in pdfs
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info(f"No PDFs found in {paths.bib_pdf}")
+
+    index_col, reset_col = st.columns([0.72, 0.28])
+    if index_col.button("Index", type="primary", width="stretch"):
+        preflight_issues = runtime_preflight(settings, paths, require_pdfs=True)
+        if preflight_issues:
+            st.error("\n".join(f"- {issue}" for issue in preflight_issues))
+        elif not pdfs:
+            st.warning("Add PDFs to the staging directory before indexing.")
+        elif ingest_pdf is None:
+            st.error("Multimodal pipeline is not available.")
+        else:
+            results: list[dict[str, Any]] = []
+            progress = st.progress(0)
+            with st.status("Preparing multimodal indexing...", expanded=True) as status:
+                st.write(f"Found {len(pdfs)} staged PDF(s).")
+                st.write("Using MinerU parsing, multimodal enrichment, fixed mpnet embeddings, and local Qdrant indexing.")
+                for index, pdf_path in enumerate(pdfs, start=1):
+                    status.update(label=f"Indexing {index}/{len(pdfs)}: {pdf_path.name}", state="running")
+                    st.write(f"Parsing and enriching `{pdf_path.name}`...")
+                    try:
+                        result = ingest_pdf(
+                            pdf_path,
+                            store_root=multimodal_store_path,
+                            text_model=settings["multimodal_text_model"],
+                            image_model=settings["multimodal_image_model"],
+                            embed_model=settings["multimodal_embed_model"],
+                            ollama_base_url=settings["ollama_base_url"],
+                            use_mineru=True,
+                            mineru_backend=settings["mineru_backend"],
+                            mineru_method=settings["mineru_method"],
+                            mineru_lang=settings["mineru_lang"],
+                            mineru_timeout=int(settings["mineru_timeout"]),
+                            enrich_images=True,
+                            enrich_tables=True,
+                            index=True,
+                            force=True,
+                        )
+                        results.append(result)
+                        st.write(
+                            f"Indexed `{pdf_path.name}` with `{result.get('parser')}`: "
+                            f"{result.get('vector_records', 0)} vectors, {result.get('images', 0)} images."
+                        )
+                    except Exception as exc:
+                        results.append({"status": "error", "source_pdf": str(pdf_path), "error": str(exc)})
+                        st.write(f"Error indexing `{pdf_path.name}`: {exc}")
+                    progress.progress(index / len(pdfs))
+                errors = [item for item in results if item.get("status") == "error"]
+                if errors:
+                    status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
+                    st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
+                else:
+                    if build_all_graphs is not None and clean_graph_store_runtime is not None:
+                        status.update(label="Building graph RAG store...", state="running")
+                        st.write("Creating graph nodes, edges, manifests, and query-ready retrieval artifacts.")
+                        try:
+                            clean_graph_store_runtime(graph_store_path)
+                            graph_backend = "ollama"
+                            graph_model = str(settings["multimodal_text_model"]).strip() or str(settings["model"]).strip()
+                            graph_cloud_provider = "openai"
+                            graph_api_key = ""
+                            graph_base_url = ""
+                            if settings["backend"] == "Cloud API" and settings.get("api_key", "").strip():
+                                graph_backend = "cloud"
+                                graph_model = str(settings["model"]).strip()
+                                graph_cloud_provider = "deepseek" if settings.get("cloud_provider") == "DeepSeek" else "openai"
+                                graph_api_key = settings.get("api_key", "").strip()
+                                graph_base_url = settings.get("openai_base_url", "").strip()
+                            graph_results = build_all_graphs(
+                                multimodal_store_path,
+                                graph_store_path,
+                                backend=graph_backend,
+                                model=graph_model,
+                                ollama_base_url=settings["ollama_base_url"],
+                                cloud_provider=graph_cloud_provider,
+                                api_key=graph_api_key,
+                                base_url=graph_base_url,
+                                enrich_root=True,
+                            )
+                            st.write(f"Built {len(graph_results)} graph document package(s).")
+                        except Exception as exc:
+                            errors.append({"status": "error", "source_pdf": "graph_build", "error": str(exc)})
+                            st.write(f"Graph build error: {exc}")
+                    if errors:
+                        status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
+                        st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
+                    else:
+                        status.update(label="Multimodal index is ready", state="complete")
+                        safe_toast("Multimodal RAG index ready")
+                        st.success(f"Indexed {len(results)} PDF(s) into `{multimodal_store_path}`.")
+                        synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
+                        if sync_error:
+                            st.warning(f"MinIO sync skipped after indexing: {sync_error}")
+                        elif synced:
+                            st.caption("MinIO sync completed for the indexed study artifacts.")
+            st.dataframe(summarize_multimodal_results(results), width="stretch", hide_index=True)
+
+    if reset_col.button("Reset Index", width="stretch"):
+        if clean_store is None:
+            st.error("Multimodal pipeline is not available.")
+        else:
+            clean_store(multimodal_store_path)
+            if clean_graph_store_runtime is not None:
+                clean_graph_store_runtime(graph_store_path)
+            safe_toast("Multimodal index reset")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Workspace Cross-Examination")
     st.caption(
         f"Query backend: Qdrant `{multimodal_store_path}` | generation: "
         f"{settings['backend']} / `{settings['model']}` | embeddings `{settings['multimodal_embed_model']}`"
@@ -2067,11 +2865,17 @@ with tab_chat:
         st.session_state["chat_messages"] = []
     if "chat_pending_question" not in st.session_state:
         st.session_state["chat_pending_question"] = ""
+    if "chat_pending_mode" not in st.session_state:
+        st.session_state["chat_pending_mode"] = "standard"
+    if "chat_mode" not in st.session_state:
+        st.session_state["chat_mode"] = "standard"
 
     toolbar_cols = st.columns([0.2, 0.8])
     if toolbar_cols[0].button("Clear conversation", width="stretch"):
         st.session_state["chat_messages"] = []
         st.session_state["chat_pending_question"] = ""
+        st.session_state["chat_pending_mode"] = st.session_state.get("chat_mode", "standard")
+        clear_case_chat_history(APP_DB_PATH, selected_case.id)
         st.rerun()
 
     st.markdown("**Ask the indexed workspace**")
@@ -2080,26 +2884,79 @@ with tab_chat:
     if queued_question:
         # Pop first to avoid infinite retry loops on generation errors.
         st.session_state["chat_pending_question"] = ""
-        with st.spinner(
-            f"Retrieving Qdrant evidence and synthesizing with {settings['backend']} / {settings['model']}..."
-        ):
-            try:
-                response = multimodal_chat_answer(
-                    queued_question,
-                    settings=settings,
-                    multimodal_store_path=multimodal_store_path,
+        queued_mode = st.session_state.get("chat_pending_mode", "standard")
+        preflight_issues = runtime_preflight(
+            settings,
+            paths,
+            multimodal_store_path=multimodal_store_path,
+            graph_store_path=graph_store_path,
+            require_multimodal_index=(queued_mode == "standard"),
+            require_graph_index=(queued_mode == "research"),
+        )
+        if preflight_issues:
+            answer = "RAG chat cannot start yet:\n\n" + "\n".join(f"- {issue}" for issue in preflight_issues)
+            artifacts = []
+            evidence_refs = []
+        else:
+            with st.spinner(
+                (
+                    f"Retrieving Qdrant evidence and synthesizing with {settings['backend']} / {settings['model']}..."
+                    if queued_mode == "standard"
+                    else f"Running graph-backed research mode with {settings['backend']} / {settings['model']}..."
                 )
-                answer = response["answer_markdown"]
-                artifacts = response.get("artifact_references", [])
-            except Exception as exc:
-                answer = f"RAG chat failed:\n\n```text\n{exc}\n```"
-                artifacts = []
-        st.session_state["chat_messages"].append({"role": "assistant", "content": answer, "artifacts": artifacts})
+            ):
+                try:
+                    if queued_mode == "research":
+                        response = graph_chat_answer(
+                            queued_question,
+                            settings=settings,
+                            graph_store_path=graph_store_path,
+                        )
+                    else:
+                        response = multimodal_chat_answer(
+                            queued_question,
+                            settings=settings,
+                            multimodal_store_path=multimodal_store_path,
+                        )
+                    answer = response["answer_markdown"]
+                    artifacts = response.get("artifact_references", [])
+                    evidence_refs = response.get("evidence_references", [])
+                except Exception as exc:
+                    answer = f"RAG chat failed:\n\n```text\n{exc}\n```"
+                    artifacts = []
+                    evidence_refs = []
+        st.session_state["chat_messages"].append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "artifacts": artifacts,
+                "evidence": evidence_refs,
+                "mode": queued_mode,
+            }
+        )
+        persist_chat_message(
+            APP_DB_PATH,
+            selected_case.id,
+            role="assistant",
+            content=answer,
+            mode=queued_mode,
+            artifacts=artifacts,
+            evidence=evidence_refs,
+        )
+        maybe_auto_sync_case(APP_DB_PATH, selected_case)
         st.rerun()
 
     for message in st.session_state["chat_messages"]:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("mode") == "research":
+                st.caption("Research Mode")
+            render_markdown_block(message["content"])
+            if message.get("evidence"):
+                render_evidence_resources(
+                    message["evidence"],
+                    bib_pdf_dir=paths.bib_pdf,
+                    key_prefix=f"chat_evidence_{abs(hash(message['content']))}",
+                )
             if message.get("artifacts"):
                 render_artifacts(message["artifacts"])
 
@@ -2108,60 +2965,111 @@ with tab_chat:
         key="multimodal_chat_input",
         width="stretch",
     )
+    chat_mode = st.radio(
+        "Reasoning mode",
+        [("standard", "🧠 Standard RAG"), ("research", "🕸 Research Mode")],
+        index=0 if st.session_state.get("chat_mode", "standard") == "standard" else 1,
+        format_func=lambda item: item[1],
+        key="chat_mode_selector_inline",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.session_state["chat_mode"] = chat_mode[0]
     if pending_question:
-        st.session_state["chat_messages"].append({"role": "user", "content": pending_question})
+        st.session_state["chat_messages"].append(
+            {
+                "role": "user",
+                "content": pending_question,
+                "mode": st.session_state.get("chat_mode", "standard"),
+            }
+        )
+        persist_chat_message(
+            APP_DB_PATH,
+            selected_case.id,
+            role="user",
+            content=pending_question,
+            mode=st.session_state.get("chat_mode", "standard"),
+            artifacts=[],
+        )
         st.session_state["chat_pending_question"] = pending_question
+        st.session_state["chat_pending_mode"] = st.session_state.get("chat_mode", "standard")
         st.rerun()
 
 
 with tab_latex:
-    left, right = st.columns([1.12, 0.88], gap="large")
-    with left:
-        st.subheader("AI Co-Author")
-        modify_instruction = st.text_area(
-            "Ask AI to modify your active LaTeX source directly",
-            height=115,
-        )
-        if st.button("Apply AI Edit To Source", type="primary", width="stretch"):
-            save_editor_if_changed(paths)
-            if not modify_instruction.strip():
-                st.warning("Enter an editing instruction first.")
-            else:
-                with st.spinner("The co-author is rewriting the LaTeX source..."):
-                    try:
-                        updated = modify_latex_source(st.session_state["latex_editor"], modify_instruction.strip(), settings)
-                        atomic_write_text(paths.paper_tex, updated)
-                        st.session_state["latex_editor"] = updated
-                        st.session_state["latex_saved_sha"] = sha256_text(updated)
-                        safe_toast("LaTeX source updated")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error("AI edit failed.")
-                        st.code(str(exc), language="text")
+    st.subheader("AI Co-Author")
+    modify_instruction = st.text_area(
+        "Ask AI to modify your active LaTeX source directly",
+        height=115,
+    )
 
-        st.text_area("Active LaTeX source", key="latex_editor", height=720)
+    if st.button("Apply AI Edit To Source", type="primary", width="stretch"):
+        save_editor_if_changed(paths)
+        preflight_issues = runtime_preflight(settings, paths, require_paper=True)
+        if preflight_issues:
+            st.error("\n".join(f"- {issue}" for issue in preflight_issues))
+        elif not modify_instruction.strip():
+            st.warning("Enter an editing instruction first.")
+        else:
+            with st.spinner("The co-author is rewriting the LaTeX source..."):
+                try:
+                    updated = modify_latex_source(st.session_state["latex_editor"], modify_instruction.strip(), settings, paths)
+                    atomic_write_text(paths.paper_tex, updated)
+                    st.session_state["latex_editor"] = updated
+                    st.session_state["latex_saved_sha"] = sha256_text(updated)
+                    safe_toast("LaTeX source updated")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("AI edit failed.")
+                    st.code(str(exc), language="text")
+
+    compile_result = st.session_state.get("latex_last_compile_result")
+    if st.button("🚀 Compile Document", type="primary", width="stretch"):
+        save_editor_if_changed(paths)
+        with st.spinner("Running pdflatex twice..."):
+            compile_result = compile_latex(paths)
+        st.session_state["latex_last_compile_result"] = compile_result
+        if compile_result["ok"]:
+            st.success(f"Compilation succeeded: {compile_result['pdf_path']}")
+            synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
+            if sync_error:
+                st.warning(f"MinIO sync skipped after compilation: {sync_error}")
+            elif synced:
+                st.caption("MinIO sync completed for the compiled LaTeX artifacts.")
+        else:
+            st.error("Compilation failed.")
+
+    source_col, preview_col = st.columns([1.08, 0.92], gap="large")
+    with source_col:
+        st.text_area("Active LaTeX source", key="latex_editor", height=760)
         save_editor_if_changed(paths)
 
-    with right:
-        st.subheader("Local Compilation")
+    with preview_col:
+        st.subheader("PDF Preview")
         st.write(f"Source: `{paths.paper_tex}`")
         st.write(f"Output: `{paths.compiled_output}`")
-        if st.button("🚀 Compile Document", type="primary", width="stretch"):
-            save_editor_if_changed(paths)
-            with st.spinner("Running pdflatex twice..."):
-                result = compile_latex(paths)
-            if result["ok"]:
-                st.success(f"Compilation succeeded: {result['pdf_path']}")
-            else:
-                st.error("Compilation failed.")
-                st.code(result.get("log", ""), language="text")
-
         pdf_path = paths.compiled_output / f"{paths.paper_tex.stem}.pdf"
         if pdf_path.exists():
+            try:
+                components.html(pdf_embed_html(pdf_path, height=760), height=780, scrolling=True)
+                st.caption("Scrollable PDF viewer")
+            except Exception:
+                previews, page_total = render_pdf_preview(pdf_path, max_pages=3)
+                st.caption(f"Compiled PDF · {page_total} page(s)")
+                for page_number, preview in enumerate(previews, start=1):
+                    st.image(preview, caption=f"Page {page_number}", width="stretch")
             st.download_button(
-                "Open compiled PDF bytes",
+                "Download compiled PDF",
                 data=pdf_path.read_bytes(),
                 file_name=pdf_path.name,
                 mime="application/pdf",
                 width="stretch",
             )
+        else:
+            st.info("Compile the document to see the PDF preview here.")
+
+        if compile_result and not compile_result.get("ok"):
+            st.code(compile_result.get("log", ""), language="text")
+        elif compile_result and compile_result.get("log"):
+            with st.expander("Compilation log", expanded=False):
+                st.code(compile_result.get("log", ""), language="text")
