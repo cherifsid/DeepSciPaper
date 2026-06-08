@@ -2,278 +2,533 @@
 
 ![DeepSciPaper Banner](asset/Gemini_Generated_Image_vof9oxvof9oxvof9.png)
 
-DeepSciPaper is a production-oriented Research Copilot for evidence-first scientific workflows. It combines:
+DeepSciPaper is a case-based scientific research workspace for:
 
-- Agentic deep search via a local `gpt-researcher` engine (autonomous crawling and report generation into your workspace)
-- Agentic multimodal RAG via MinerU, Ollama enrichment, and local Qdrant evidence retrieval
-- A Streamlit workspace UI for discovery, indexing, grounded Q\&A, and LaTeX authoring/compilation
-- Dual LLM backends: Cloud (OpenAI/DeepSeek) and Local (Ollama)
+- agentic deep literature search
+- multimodal PDF parsing and indexing
+- graph-backed and vector-backed RAG
+- evidence-grounded chat
+- LaTeX co-authoring and local compilation
+- case persistence with SQLite
+- artifact backup to MinIO
 
-The UI is workspace-agnostic: you can rename the workspace title and point the app at any folder paths directly from the interface.
+The app is built around one idea: a study should be reproducible, inspectable, and portable. Every case keeps its own PDFs, multimodal store, graph store, compiled outputs, and chat history.
 
-## System Overview
 
-DeepSciPaper now uses a fully local-first multimodal retrieval architecture for indexed workspace reasoning.
+### Demo 1
+<p align="center">
+  <img src="asset/demo 1.gif" alt="App Demo" width="90%">
+</p>
 
-The flow is split into two cooperating systems:
 
-- `Deep Search`: `gpt-researcher` explores the web, repositories, and scholarly sources, then writes reports and discovered PDFs into `bib_pdf/`.
-- `Agentic Multimodal RAG`: staged PDFs are parsed with MinerU, transformed into multimodal artifacts, indexed into local Qdrant, and then synthesized by the active chat model selected in the UI.
 
-The result is a workspace where discovery and retrieval are separate on purpose:
+## Current Product Surface
 
-- discovery is optimized for breadth, source acquisition, and report generation
-- retrieval is optimized for grounded answers over local evidence you can inspect
-- generation is decoupled from indexing, so you can switch between Ollama and cloud models at chat time without rebuilding the index
+DeepSciPaper now includes:
 
-## What You Get
+- login screen with demo credentials
+- home page with case overview
+- case creation and switching
+- Deep Search workspace
+- Agentic Multimodal RAG Chat workspace
+- Live LaTeX Studio
+- SQLite-backed app state
+- optional MinIO artifact sync
 
-- `Deep Search & Multimodal Indexing`: run GPT Researcher, stage PDFs, parse with MinerU, enrich artifacts, and index into local Qdrant
-- `Agentic Multimodal RAG Chat`: answers grounded in retrieved text, tables, figures, captions, and artifact paths
-- `Live LaTeX Studio & Local Compiling`: AI-assisted LaTeX edits plus local `pdflatex` compilation
+The app is case-first: every workflow runs inside the active study, and a successful indexing run now finishes by building both the multimodal vector store and the graph-RAG artifacts needed for Research Mode.
 
-## How The RAG Chat Works
+Default login:
 
-The chat system is agentic, multimodal, and evidence-first. It does not answer from raw PDFs directly. Instead, it answers from an indexed evidence store built from your workspace documents.
+- username: `admin`
+- password: `admin`
 
-### Retrieval Pipeline
+## Case-Based Workspace Layout
 
-1. PDFs are staged in `bib_pdf/`.
-2. `multimodal_pipeline.py ingest` parses each PDF with MinerU.
-3. MinerU outputs structured Markdown, JSON, and extracted visual assets.
-4. The pipeline separates the document into:
-   - text sections and section chunks
-   - tables
-   - images and figures
-5. Text chunks are prepared for retrieval.
-6. Tables are summarized with the configured `--text-model`.
-7. Figures and images are captioned with the configured `--image-model`.
-8. Every retrieval record is embedded with the fixed model `sentence-transformers/all-mpnet-base-v2`.
-9. Embedded records are stored in local Qdrant with pointers back to the original artifact paths.
-
-### Query-Time Pipeline
-
-1. The user submits a question in the `Agentic Multimodal RAG Chat` tab.
-2. The app embeds the question with the same fixed mpnet embedding model.
-3. Qdrant returns the top evidence records across text, table, and image modalities.
-4. The app builds an evidence bundle containing:
-   - retrieval score
-   - modality
-   - source PDF name
-   - section title when available
-   - artifact path
-   - display text, summary, or caption
-5. The synthesizer skill in `agents/skills/multimodal_synthesizer_chat.md` instructs the active LLM to:
-   - answer only from retrieved evidence
-   - cite claims with evidence IDs such as `[E1]`
-   - preserve uncertainty when evidence is weak or conflicting
-   - surface table and image artifacts when relevant
-6. The final answer is rendered in Markdown in the chat UI, with expandable artifact previews.
-
-### Generation Model Routing
-
-The retrieval index is model-stable, but the answer-generation model is runtime-switchable:
-
-- `Local Ollama`: the answer is generated with the selected Ollama model and the current UI hyperparameters
-- `Cloud API`: the answer is generated with the selected OpenAI or DeepSeek-compatible model and the current UI hyperparameters
-
-This means indexing and answer generation are intentionally separated:
-
-- indexing uses MinerU + enrichment models + fixed mpnet embeddings
-- chat generation uses whichever inference backend the user chooses at runtime
-
-## RAG Graph
+Each case lives under:
 
 ```text
-                           +----------------------+
-                           |   User Deep Search   |
-                           |   Query / Web Task   |
-                           +----------+-----------+
-                                      |
-                                      v
-                      +----------------------------------+
-                      |   GPT Researcher Deep Search     |
-                      |   reports + discovered PDFs      |
-                      +----------------+-----------------+
-                                       |
-                                       v
-                               +---------------+
-                               |   bib_pdf/    |
-                               | staged PDFs   |
-                               +-------+-------+
-                                       |
-                                       v
-                    +----------------------------------------+
-                    | multimodal_pipeline.py ingest          |
-                    | MinerU parse + multimodal enrichment   |
-                    +----------------+-----------------------+
-                                     |
-          +--------------------------+---------------------------+
-          |                          |                           |
-          v                          v                           v
-+------------------+      +--------------------+      +--------------------+
-| Text sections    |      | Table extraction   |      | Figure / image     |
-| + markdown chunks|      | + LLM summaries    |      | + vision captions   |
-+---------+--------+      +----------+---------+      +----------+---------+
-          |                          |                           |
-          +--------------------------+---------------------------+
-                                     |
-                                     v
-                 +-----------------------------------------------+
-                 | fixed embeddings: all-mpnet-base-v2           |
-                 | records keep source PDF + section + path      |
-                 +----------------------+------------------------+
-                                        |
-                                        v
-                             +----------------------+
-                             |  Local Qdrant Index  |
-                             | multimodal evidence  |
-                             +----------+-----------+
-                                        ^
-                                        |
-                             user question embedded
-                                        |
-                                        v
-                     +------------------------------------------+
-                     | Agentic Multimodal RAG Chat in app.py    |
-                     | retrieve top evidence bundle             |
-                     +------------------+-----------------------+
-                                        |
-                                        v
-                 +------------------------------------------------------+
-                 | Active synthesis model selected in UI                |
-                 | Ollama or Cloud API + current inference parameters   |
-                 +------------------+-----------------------------------+
-                                    |
-                                    v
-                      +----------------------------------+
-                      | Markdown answer with evidence    |
-                      | IDs and artifact references      |
-                      +----------------------------------+
+cases/<case-slug>/
+├── bib_pdf/
+├── multimodal_store/
+├── scientific_graph_rag_store/
+├── compiled_output/
+└── paper.tex
 ```
 
-## Repo Layout
+This means one study does not contaminate another. The active case controls what Deep Search, indexing, chat, and LaTeX work against.
 
-- `app.py`: monolithic Streamlit app
-- `agents/skills/`: agent skill packs (Deep Search + RAG Chat quality playbooks)
-- `engines/gpt-researcher/`: GPT Researcher engine (vendored as a local engine)
-- `bib_pdf/`: runtime PDF staging (ignored in git)
-- `multimodal_pipeline.py`: batch/CLI pipeline for MinerU parsing, multimodal enrichment, Qdrant indexing, and local agentic RAG
-- `multimodal_store/`: runtime multimodal document store and Qdrant local index (ignored in git)
+## High-Level Architecture
 
-## Core Design Choices
+```mermaid
+flowchart TD
+    A[User logs in] --> B[Select or create case]
+    B --> C[Deep Search]
+    C --> D[bib_pdf/]
+    D --> E[MinerU + multimodal enrichment]
+    E --> F[multimodal_store/]
+    F --> G[Qdrant local vectors]
+    F --> H[Scientific graph build]
+    H --> I[scientific_graph_rag_store/]
+    G --> J[Standard RAG]
+    I --> K[Research Mode]
+    J --> L[Agentic Multimodal RAG Chat]
+    K --> L
+    L --> M[Persist chat in SQLite]
+    B --> N[Live LaTeX Studio]
+    N --> O[compiled_output/paper.pdf]
+    D --> P[MinIO sync]
+    F --> P
+    I --> P
+    O --> P
+    M --> P
+```
 
-- No PageIndex remains in the active architecture. The retrieval system is now fully based on MinerU parsing, multimodal enrichment, and Qdrant-backed evidence retrieval.
-- Embeddings are fixed to `sentence-transformers/all-mpnet-base-v2` to keep index dimensionality stable and avoid Ollama embedding failures.
-- Summaries and captions are contextualized with source-paper and section metadata before indexing.
-- The synthesizer is guided by a dedicated agent skill so the final answer stays grounded, citation-aware, and artifact-aware.
-- The answer model is swappable at runtime without forcing re-indexing.
+## Application Navigation
 
-## Prerequisites
+```mermaid
+flowchart LR
+    A[Login] --> B[Home]
+    B --> C[New Case]
+    B --> D[Deep Search]
+    B --> E[Agentic Multimodal RAG Chat]
+    B --> F[Live LaTeX Studio]
+    D --> E
+    E --> F
+```
 
-- Conda (or mamba)
-- Python 3.11
-- Ollama (optional, for local models)
-- MinerU (optional but recommended, for structured multimodal PDF parsing)
-- TeX Live / `pdflatex` (optional, for local LaTeX compilation)
+## Deep Search Workflow
 
-## Setup (Recommended)
+The Deep Search tab is intentionally narrow now:
 
-1) Create and activate the environment:
+- deep search query
+- report type
+- research-plan generation
+- plan editing
+- approved research execution
+- final report reading
+- source explorer
+
+The deep-search engine is local `gpt-researcher`, vendored in:
+
+```text
+engines/gpt-researcher/
+```
+
+When a search completes, the app:
+
+1. saves the report into the active case `bib_pdf/`
+2. validates discovered links
+3. downloads reachable PDFs when available
+4. keeps the report readable in-app
+5. offers a button to jump directly to indexing/chat
+
+## Multimodal Indexing Workflow
+
+The indexing controls live in the **Agentic Multimodal RAG Chat** tab because that is where users actually need workspace readiness.
+
+When you click **Index**, the app now performs:
+
+1. MinerU parsing
+2. multimodal artifact extraction
+3. table summarization
+4. figure/image captioning
+5. mpnet embedding creation
+6. Qdrant indexing
+7. automatic scientific graph creation
+
+So indexing no longer stops at the multimodal store. At the end of a successful run, the case is ready for:
+
+- Standard RAG
+- Research Mode
+
+### Index-Time Artifact Flow
+
+```mermaid
+flowchart LR
+    A[PDFs in case bib_pdf/] --> B[MinerU parse]
+    B --> C[Markdown]
+    B --> D[Raw JSON]
+    B --> E[Extracted tables]
+    B --> F[Extracted figures/images]
+    C --> G[Text retrieval records]
+    D --> G
+    E --> H[Table summaries]
+    F --> I[Vision captions]
+    G --> J[mpnet embeddings]
+    H --> J
+    I --> J
+    J --> K[local Qdrant store]
+    G --> L[Scientific graph builder]
+    H --> L
+    I --> L
+    L --> M[nodes.json]
+    L --> N[edges.json]
+    L --> O[graph.json]
+```
+
+![DeepSciPaper Standard Multimodal RAG](asset/Gemini_Generated_Image_fnipmefnipmefnip.png)
+
+The standard multimodal RAG path is still the fast lane in the product: it retrieves grounded evidence from the indexed multimodal store first, then synthesizes with the currently selected cloud or Ollama model.
+
+## Two RAG Modes
+
+The chat tab has two retrieval modes:
+
+### 1. Standard RAG
+
+Standard RAG is the faster path.
+
+It uses:
+
+- `multimodal_store/`
+- Qdrant retrieval
+- evidence bundle assembly
+- synthesis with the active UI-selected model
+
+Best for:
+
+- quick grounded answers
+- scanning evidence fast
+- iterative questioning
+
+### 2. Research Mode
+
+Research Mode is the deeper path.
+
+It uses:
+
+- `scientific_graph_rag_store/`
+- multi-query expansion
+- graph node ranking
+- relationship expansion
+- evidence aggregation across node links
+- synthesis with the active UI-selected model
+
+Best for:
+
+- section-aware reasoning
+- table/figure/text linkage
+- more structured research answers
+- higher interpretability
+
+Both modes render through the same answer surface:
+
+- markdown answer body
+- evidence popovers
+- local PDF previews
+- table/image artifact previews
+- downloadable source files
+
+## How Graph RAG Works
+
+Each indexed paper gets an independent knowledge graph.
+
+### Node Types
+
+- paper root
+- section/text node
+- table node
+- figure node
+
+### Stored Context
+
+Each node contains:
+
+- global paper context
+- local section context
+- previous node
+- next node
+- related node links
+- artifact path when relevant
+
+### Relationships
+
+The graph builder creates:
+
+- `contains`
+- `next`
+- `previous`
+- `same_section`
+- `references_table`
+- `references_figure`
+- `contextual_neighbor`
+- `semantic_similarity`
+
+### Graph Query Path
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Chat UI
+    participant G as Graph RAG
+    participant L as LLM
+
+    U->>C: Ask research question
+    C->>G: run_query(...)
+    G->>L: generate search expansions
+    G->>G: rank graph nodes
+    G->>G: expand via relationships
+    G->>G: build evidence bundle
+    G->>L: synthesize grounded answer
+    L-->>G: markdown answer
+    G-->>C: answer + evidence + artifacts
+    C-->>U: rendered response with popovers
+```
+
+## Evidence Display
+
+Evidence is meant to be inspectable, not decorative.
+
+The app now supports:
+
+- evidence popovers from chat answers
+- evidence popovers from deep-search reports
+- local PDF preview
+- figure preview when an asset path points to an image
+- download button for the underlying PDF
+- source links in the report explorer
+
+## LaTeX Studio
+
+The LaTeX studio now behaves like a real writing surface:
+
+- AI edit controls at the top
+- compile button directly under the AI edit action
+- source editor on the left
+- scrollable PDF preview on the right
+- downloadable compiled PDF
+- compile logs below the preview
+- AI-edited LaTeX is validated before it is written back to `paper.tex`
+
+This is case-scoped, so each case has its own `paper.tex` and compiled PDF.
+
+## SQLite Persistence
+
+SQLite stores:
+
+- cases
+- chat history
+- sync history
+
+Database default:
+
+```text
+app_state/research_copilot.db
+```
+
+## MinIO Sync
+
+If configured, MinIO sync uploads:
+
+- `bib_pdf/`
+- `multimodal_store/`
+- `scientific_graph_rag_store/`
+- `compiled_output/`
+- `paper.tex`
+- exported case metadata
+- exported chat history
+
+This makes a study portable beyond the local machine.
+
+## Installation
+
+### 1. Create environment
 
 ```bash
 conda create -n research_copilot python=3.11 -y
 conda activate research_copilot
 ```
 
-2) Install dependencies:
+### 2. Install Python dependencies
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-3) Create your `.env`:
+### 3. Install LaTeX system packages
+
+For Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  texlive-latex-base \
+  texlive-latex-recommended \
+  texlive-latex-extra \
+  texlive-fonts-recommended \
+  texlive-fonts-extra \
+  texlive-bibtex-extra \
+  texlive-plain-generic \
+  texlive-lang-english \
+  latexmk \
+  dvipng \
+  poppler-utils
+```
+
+If you want a fuller TeX environment:
+
+```bash
+sudo apt install -y texlive-full
+```
+
+### 4. Create your environment file
 
 ```bash
 cp .env.example .env
 ```
 
-Fill in at least one of:
+## Important `.env` Settings
 
-- `TAVILY_API_KEY` (recommended for better web search)
-- `OPENAI_API_KEY` or `DEEPSEEK_API_KEY` (if you use Cloud API backend)
+Core examples:
 
-If you use local models:
+```env
+OLLAMA_BASE_URL=http://localhost:11434
+DEFAULT_MODEL=gemma4:26b
 
-- Ensure Ollama is running at `OLLAMA_BASE_URL` (default `http://localhost:11434`)
-- Pull a model, for example:
+OPENAI_API_KEY=
+DEEPSEEK_API_KEY=
+TAVILY_API_KEY=
 
-```bash
-ollama pull gpt-oss:20b
+APP_DB_PATH=./app_state/research_copilot.db
+SCIENTIFIC_GRAPH_RAG_STORE_DIR=./scientific_graph_rag_store
+
+MINIO_ENDPOINT=
+MINIO_ACCESS_KEY=
+MINIO_SECRET_KEY=
+MINIO_BUCKET=
+MINIO_SECURE=false
 ```
 
-For image/graph captioning, pull a vision-capable Ollama model and set `MULTIMODAL_IMAGE_MODEL` in `.env`:
+## Run The App
 
 ```bash
-ollama pull llama3.2-vision:11b
-```
-
-4) Run the app:
-
-```bash
-python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+conda run --no-capture-output -n research_copilot python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
 Open:
 
-- http://localhost:8501
-
-## Usage Notes
-
-- Add PDFs by dropping them into `bib_pdf/` (or use Deep Search to acquire them).
-- Use `Index Workspace With MinerU + Multimodal RAG` to parse staged PDFs, extract artifacts, caption figures, summarize tables, embed records, and index into local Qdrant.
-- The RAG chat retrieves from Qdrant and answers in Markdown with evidence IDs plus image/table artifact paths where available.
-- The embedding model for multimodal retrieval is always `sentence-transformers/all-mpnet-base-v2`, even if you change text or vision generation models.
-- The text model and image model used during ingest affect table summaries and figure captions, while the chat model selected in the UI affects only answer generation.
-
-## Multimodal CLI
-
-Clean a previous local multimodal test store:
-
-```bash
-python multimodal_pipeline.py clean --store ./multimodal_store
+```text
+http://localhost:8501
 ```
 
-Batch ingest staged PDFs with MinerU, Ollama table summaries, Ollama image captions, and local Qdrant indexing:
+## Typical End-to-End Usage
+
+### Create a new case
+
+1. log in with `admin` / `admin`
+2. go to **New Case**
+3. enter case details
+4. switch into the new case
+
+### Run Deep Search
+
+1. open **Deep Search & Multimodal Indexing**
+2. write the research objective
+3. generate a research plan
+4. review the planned queries
+5. start approved research
+6. inspect the final report
+
+### Build retrieval-ready workspace
+
+1. open **Agentic Multimodal RAG Chat**
+2. click **Index**
+3. wait for:
+   - multimodal store creation
+   - Qdrant indexing
+   - graph-store build
+   - chat-ready evidence artifacts
+4. ask questions immediately
+
+### Work in chat
+
+- choose `🧠 Standard RAG` for faster answers
+- choose `🕸 Research Mode` for graph-backed answers
+- inspect evidence popovers
+- review PDF and figure artifacts
+
+### Write the paper
+
+1. open **Live LaTeX Studio & Local Compiling**
+2. ask AI to update the source
+3. compile
+4. inspect the PDF preview
+5. download the compiled paper
+
+## CLI Examples
+
+### Clean multimodal store
+
+```bash
+python multimodal_pipeline.py clean --store ./cases/text_segmentation/multimodal_store
+```
+
+### Rebuild multimodal store
 
 ```bash
 python multimodal_pipeline.py ingest \
-  --pdf-dir ./bib_pdf \
-  --store ./multimodal_store \
+  --pdf-dir ./cases/text_segmentation/bib_pdf \
+  --store ./cases/text_segmentation/multimodal_store \
   --mineru-backend pipeline \
   --mineru-method auto \
   --mineru-lang en \
   --mineru-timeout 1800 \
-  --text-model gpt-oss:20b \
-  --image-model llama3.2-vision:11b \
-  --embed-model sentence-transformers/all-mpnet-base-v2 \
+  --text-model gemma4:26b \
+  --image-model qwen3-vl:32b \
   --enrich-images \
   --force
 ```
 
-Ingest without image captions for a faster first pass:
+### Rebuild graph store
 
 ```bash
-python multimodal_pipeline.py ingest --pdf-dir ./bib_pdf --store ./multimodal_store --mineru-backend pipeline
+python scientific_graph_rag.py build \
+  --source-store ./cases/text_segmentation/multimodal_store \
+  --graph-store ./cases/text_segmentation/scientific_graph_rag_store \
+  --backend ollama \
+  --model gemma4:26b \
+  --ollama-base-url http://localhost:11434
 ```
 
-Ask the local multimodal index:
+### Query graph RAG directly
 
 ```bash
-python multimodal_pipeline.py query "Which papers provide benchmark evidence for SDG classification?" --format markdown --limit 10
+python scientific_graph_rag.py query \
+  "Which papers provide benchmark evidence for text segmentation?" \
+  --graph-store ./cases/text_segmentation/scientific_graph_rag_store \
+  --backend ollama \
+  --model gemma4:26b \
+  --format markdown
 ```
 
-## Security
+## Notes On Models
 
-- Do not commit `.env` (this repo ignores it by default).
-- If you accidentally committed secrets earlier, rotate them and rewrite git history before making the repo public.
+- Multimodal indexing uses the configured text model for table summaries and the configured image model for figure understanding.
+- Embeddings are fixed to `sentence-transformers/all-mpnet-base-v2` to avoid the NaN failures we observed with some Ollama embedding models.
+- Standard RAG and Research Mode both honor the active generation backend selected in the UI:
+  - local Ollama
+  - cloud OpenAI-compatible providers
+
+## Main Files
+
+- [app.py](app.py)
+- [multimodal_pipeline.py](multimodal_pipeline.py)
+- [scientific_graph_rag.py](scientific_graph_rag.py)
+- [case_management.py](case_management.py)
+- [requirements.txt](requirements.txt)
+- [.env.example](.env.example)
+
+## Current State
+
+This branch is the case-managed workspace branch with:
+
+- login
+- home page
+- case management
+- SQLite persistence
+- MinIO sync hooks
+- automatic graph build after multimodal indexing
+- dual RAG modes
+- LaTeX PDF preview
+
+That gives you one app surface for research discovery, structured indexing, graph reasoning, and manuscript production.

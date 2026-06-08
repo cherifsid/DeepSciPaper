@@ -16,6 +16,9 @@
 compiled_output/
 results/
 multimodal_store/
+scientific_graph_rag_store/
+cases/
+app_state/
 __pycache__/
 .streamlit/secrets.toml
 logs/
