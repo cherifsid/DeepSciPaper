@@ -31,8 +31,6 @@ class CaseRecord:
     bib_pdf_dir: str
     multimodal_store_dir: str
     graph_store_dir: str
-    compiled_output_dir: str
-    paper_tex_path: str
     minio_prefix: str
     is_legacy: bool
     created_at: str
@@ -67,8 +65,6 @@ def row_to_case(row: sqlite3.Row | None) -> CaseRecord | None:
         bib_pdf_dir=str(row["bib_pdf_dir"]),
         multimodal_store_dir=str(row["multimodal_store_dir"]),
         graph_store_dir=str(row["graph_store_dir"]),
-        compiled_output_dir=str(row["compiled_output_dir"]),
-        paper_tex_path=str(row["paper_tex_path"]),
         minio_prefix=str(row["minio_prefix"]),
         is_legacy=bool(int(row["is_legacy"])),
         created_at=str(row["created_at"]),
@@ -90,8 +86,6 @@ def init_db(database_path: Path) -> None:
                 bib_pdf_dir TEXT NOT NULL,
                 multimodal_store_dir TEXT NOT NULL,
                 graph_store_dir TEXT NOT NULL,
-                compiled_output_dir TEXT NOT NULL,
-                paper_tex_path TEXT NOT NULL,
                 minio_prefix TEXT NOT NULL,
                 is_legacy INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -161,102 +155,19 @@ def case_paths(case: CaseRecord) -> dict[str, Path]:
         "bib_pdf": Path(case.bib_pdf_dir),
         "multimodal_store": Path(case.multimodal_store_dir),
         "graph_store": Path(case.graph_store_dir),
-        "compiled_output": Path(case.compiled_output_dir),
-        "paper_tex": Path(case.paper_tex_path),
     }
 
 
 def ensure_legacy_case(database_path: Path, root: Path, workspace_title: str) -> CaseRecord | None:
-    def root_has_legacy_content(repo_root: Path) -> bool:
-        bib_pdf = repo_root / "bib_pdf"
-        multimodal_manifests = repo_root / "multimodal_store" / "manifests"
-        graph_manifests = repo_root / "scientific_graph_rag_store" / "manifests"
-        compiled_output = repo_root / "compiled_output"
-        if bib_pdf.exists() and any(path.is_file() for path in bib_pdf.iterdir()):
-            return True
-        if multimodal_manifests.exists() and any(path.is_file() for path in multimodal_manifests.iterdir()):
-            return True
-        if graph_manifests.exists() and any(path.is_file() for path in graph_manifests.iterdir()):
-            return True
-        if compiled_output.exists() and any(path.is_file() and path.suffix.lower() == ".pdf" for path in compiled_output.iterdir()):
-            return True
-        return False
-
+    del root, workspace_title
     legacy = get_case_by_slug(database_path, "legacy-workspace")
-    if not root_has_legacy_content(root):
-        if legacy is not None:
-            with connect(database_path) as conn:
-                conn.execute("DELETE FROM chat_messages WHERE case_id = ?", (legacy.id,))
-                conn.execute("DELETE FROM sync_events WHERE case_id = ?", (legacy.id,))
-                conn.execute("DELETE FROM cases WHERE id = ?", (legacy.id,))
-        return None
-    now = utc_now_iso()
-    payload = {
-        "slug": "legacy-workspace",
-        "name": workspace_title,
-        "description": "Existing workspace data discovered at the repository root.",
-        "research_goal": "Preserve and browse the original deep-search workspace.",
-        "root_dir": str(root.resolve()),
-        "bib_pdf_dir": str((root / "bib_pdf").resolve()),
-        "multimodal_store_dir": str((root / "multimodal_store").resolve()),
-        "graph_store_dir": str((root / "scientific_graph_rag_store").resolve()),
-        "compiled_output_dir": str((root / "compiled_output").resolve()),
-        "paper_tex_path": str((root / "paper.tex").resolve()),
-        "minio_prefix": "cases/legacy-workspace",
-        "is_legacy": 1,
-    }
-    with connect(database_path) as conn:
-        if legacy is None:
-            conn.execute(
-                """
-                INSERT INTO cases (
-                    slug, name, description, research_goal, root_dir, bib_pdf_dir,
-                    multimodal_store_dir, graph_store_dir, compiled_output_dir,
-                    paper_tex_path, minio_prefix, is_legacy, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    payload["slug"],
-                    payload["name"],
-                    payload["description"],
-                    payload["research_goal"],
-                    payload["root_dir"],
-                    payload["bib_pdf_dir"],
-                    payload["multimodal_store_dir"],
-                    payload["graph_store_dir"],
-                    payload["compiled_output_dir"],
-                    payload["paper_tex_path"],
-                    payload["minio_prefix"],
-                    payload["is_legacy"],
-                    now,
-                    now,
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE cases
-                SET name = ?, description = ?, research_goal = ?, root_dir = ?, bib_pdf_dir = ?,
-                    multimodal_store_dir = ?, graph_store_dir = ?, compiled_output_dir = ?,
-                    paper_tex_path = ?, minio_prefix = ?, updated_at = ?
-                WHERE slug = ?
-                """,
-                (
-                    payload["name"],
-                    payload["description"],
-                    payload["research_goal"],
-                    payload["root_dir"],
-                    payload["bib_pdf_dir"],
-                    payload["multimodal_store_dir"],
-                    payload["graph_store_dir"],
-                    payload["compiled_output_dir"],
-                    payload["paper_tex_path"],
-                    payload["minio_prefix"],
-                    now,
-                    payload["slug"],
-                ),
-            )
-    return get_case_by_slug(database_path, "legacy-workspace")  # type: ignore[return-value]
+    if legacy is not None:
+        with connect(database_path) as conn:
+            conn.execute("DELETE FROM chat_messages WHERE case_id = ?", (legacy.id,))
+            conn.execute("DELETE FROM sync_events WHERE case_id = ?", (legacy.id,))
+            conn.execute("DELETE FROM cases WHERE id = ?", (legacy.id,))
+    return None
+
 
 
 def create_case(database_path: Path, root: Path, name: str, description: str = "", research_goal: str = "") -> CaseRecord:
@@ -265,9 +176,7 @@ def create_case(database_path: Path, root: Path, name: str, description: str = "
     bib_pdf = case_root / "bib_pdf"
     multimodal_store = case_root / "multimodal_store"
     graph_store = case_root / "scientific_graph_rag_store"
-    compiled_output = case_root / "compiled_output"
-    paper_tex = case_root / "paper.tex"
-    for path in (case_root, bib_pdf, multimodal_store, graph_store, compiled_output):
+    for path in (case_root, bib_pdf, multimodal_store, graph_store):
         path.mkdir(parents=True, exist_ok=True)
 
     now = utc_now_iso()
@@ -276,9 +185,8 @@ def create_case(database_path: Path, root: Path, name: str, description: str = "
             """
             INSERT INTO cases (
                 slug, name, description, research_goal, root_dir, bib_pdf_dir,
-                multimodal_store_dir, graph_store_dir, compiled_output_dir,
-                paper_tex_path, minio_prefix, is_legacy, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                multimodal_store_dir, graph_store_dir, minio_prefix, is_legacy, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 slug,
@@ -289,14 +197,13 @@ def create_case(database_path: Path, root: Path, name: str, description: str = "
                 str(bib_pdf),
                 str(multimodal_store),
                 str(graph_store),
-                str(compiled_output),
-                str(paper_tex),
                 f"cases/{slug}",
                 now,
                 now,
             ),
         )
     return get_case_by_slug(database_path, slug)  # type: ignore[return-value]
+
 
 
 def update_case_metadata(database_path: Path, case_id: int, *, name: str, description: str, research_goal: str) -> CaseRecord | None:
@@ -499,8 +406,6 @@ def sync_case_to_minio(database_path: Path, case: CaseRecord) -> dict[str, Any]:
     upload_file_tree("bib_pdf", paths["bib_pdf"])
     upload_file_tree("multimodal_store", paths["multimodal_store"])
     upload_file_tree("scientific_graph_rag_store", paths["graph_store"])
-    upload_file_tree("compiled_output", paths["compiled_output"])
-    upload_file_tree("paper", paths["paper_tex"])
 
     payload = export_case_payload(database_path, case)
     upload_bytes(

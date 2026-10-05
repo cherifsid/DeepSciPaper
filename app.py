@@ -8,10 +8,7 @@ import importlib.util
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 import logging
 import traceback
@@ -320,17 +317,12 @@ class StreamlitLoggingCaptureHandler(logging.Handler):
 @dataclass(frozen=True)
 class RuntimePaths:
     bib_pdf: Path
-    compiled_output: Path
-    paper_tex: Path
 
 
 def resolve_workspace_path(raw_path: str) -> Path:
     path = Path(raw_path.strip() or ".").expanduser()
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
 
-
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
@@ -357,92 +349,10 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
-LATEX_ESCAPE = {
-    "\\": r"\textbackslash{}",
-    "&": r"\&",
-    "%": r"\%",
-    "$": r"\$",
-    "#": r"\#",
-    "_": r"\_",
-    "{": r"\{",
-    "}": r"\}",
-    "~": r"\textasciitilde{}",
-    "^": r"\textasciicircum{}",
-}
 
-
-def latex_escape(value: str) -> str:
-    return "".join(LATEX_ESCAPE.get(char, char) for char in value)
-
-
-def latex_template(workspace_title: str) -> str:
-    title = latex_escape(workspace_title)
-    title_for_text = workspace_title.replace("``", '"').replace("''", '"')
-    return rf"""\documentclass[11pt]{{article}}
-\usepackage[margin=1in]{{geometry}}
-\usepackage{{booktabs}}
-\usepackage{{longtable}}
-\usepackage{{graphicx}}
-\usepackage{{xcolor}}
-\usepackage{{hyperref}}
-\usepackage{{enumitem}}
-
-\title{{{title}}}
-\author{{Research Copilot Workspace}}
-\date{{\today}}
-
-\begin{{document}}
-\maketitle
-
-\begin{{abstract}}
-This living manuscript captures a reproducible research synthesis for the workspace titled ``{latex_escape(title_for_text)}.'' The document is designed to be edited continuously as new literature is discovered, parsed into multimodal artifacts, and cross-examined through the local Research Copilot environment.
-\end{{abstract}}
-
-\section{{Research Aim}}
-The project investigates methods, evidence, and evaluation protocols for {latex_escape(workspace_title.lower())}. The manuscript should preserve traceable claims, clearly separate empirical findings from interpretation, and cite supporting sources as the workspace evidence base grows.
-
-\section{{Evidence Base}}
-The evidence base is maintained outside this manuscript in the workspace directories. Primary literature PDFs are staged in \texttt{{bib\_pdf/}}, multimodal MinerU artifacts and local Qdrant indexes are stored in \texttt{{multimodal\_store/}}, and compiled artifacts are written to \texttt{{compiled\_output/}}.
-
-\section{{Methodological Notes}}
-The intended retrieval path is agentic and multimodal. Documents are parsed into Markdown, raw JSON, tables, figures, captions, and local embedding records. The co-authoring workflow should use those artifact references to ground synthesis, comparisons, and claims.
-
-\section{{Draft Synthesis}}
-This section is the active synthesis area. As the workspace accumulates indexed primary literature, revise claims with section-level and page-level evidence references.
-
-\section{{Open Research Questions}}
-\begin{{enumerate}}[leftmargin=*]
-    \item Which document fields provide the most reliable signal for the classification task?
-    \item Which methods produce robust labels under sparse supervision?
-    \item What evidence exists for cross-domain, cross-jurisdictional, or multilingual generalization?
-    \item How should false positives be handled when labels inform high-impact decisions?
-\end{{enumerate}}
-
-\section{{Conclusion}}
-This document is ready for iterative AI-assisted editing and local compilation.
-
-\end{{document}}
-"""
-
-
-def ensure_bootstrap_files(paths: RuntimePaths, workspace_title: str) -> bool:
+def ensure_bootstrap_files(paths: RuntimePaths) -> None:
     paths.bib_pdf.mkdir(parents=True, exist_ok=True)
-    paths.compiled_output.mkdir(parents=True, exist_ok=True)
 
-    created_paper = False
-    if not paths.paper_tex.exists():
-        atomic_write_text(paths.paper_tex, latex_template(workspace_title))
-        created_paper = True
-    return created_paper
-
-
-def sync_latex_session(paper_path: Path) -> None:
-    active_path = str(paper_path)
-    if st.session_state.get("active_paper_path") != active_path or "latex_editor" not in st.session_state:
-        paper_text = paper_path.read_text(encoding="utf-8") if paper_path.exists() else ""
-        st.session_state["active_paper_path"] = active_path
-        st.session_state["latex_editor"] = paper_text
-        st.session_state["latex_saved_sha"] = sha256_text(paper_text)
 
 
 def run_async(coro: Any) -> Any:
@@ -523,7 +433,6 @@ def runtime_preflight(
     require_pdfs: bool = False,
     require_multimodal_index: bool = False,
     require_graph_index: bool = False,
-    require_paper: bool = False,
 ) -> list[str]:
     issues: list[str] = []
     if not settings.get("model", "").strip():
@@ -546,9 +455,6 @@ def runtime_preflight(
         has_graphs = any(graph_store_path.glob("graphs/*/graph.json"))
         if not has_graphs:
             issues.append("The graph RAG store is empty. Run Index before using Research Mode.")
-    if require_paper and not paths.paper_tex.exists():
-        issues.append(f"The LaTeX source file is missing: `{paths.paper_tex}`.")
-
     return issues
 
 
@@ -874,15 +780,57 @@ def render_markdown_block(text: str) -> None:
     st.markdown(clean_markdown_for_display(text), unsafe_allow_html=True)
 
 
-def pdf_embed_html(pdf_path: Path, height: int = 440) -> str:
-    encoded = base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
+@st.cache_data(show_spinner=False)
+def render_pdf_page_payloads(
+    pdf_path_str: str,
+    file_mtime_ns: int,
+    *,
+    scale: float = 1.2,
+    max_pages: int | None = None,
+) -> tuple[list[str], int]:
+    del file_mtime_ns
+    import fitz
+
+    payloads: list[str] = []
+    pdf_path = Path(pdf_path_str)
+    with fitz.open(pdf_path) as doc:
+        page_total = len(doc)
+        limit = page_total if max_pages is None else min(max_pages, page_total)
+        for page_index in range(limit):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            payloads.append(base64.b64encode(pix.tobytes("png")).decode("utf-8"))
+    return payloads, page_total
+
+
+def pdf_scroll_preview_html(pdf_path: Path, *, height: int = 440, max_pages: int | None = None, scale: float = 1.2) -> str:
+    payloads, page_total = render_pdf_page_payloads(
+        str(pdf_path),
+        pdf_path.stat().st_mtime_ns,
+        scale=scale,
+        max_pages=max_pages,
+    )
+    rendered_count = len(payloads)
+    images_html = "".join(
+        (
+            '<div style="margin:0 auto 14px auto; max-width:100%;">'
+            f'<img src="data:image/png;base64,{payload}" '
+            'style="display:block; width:100%; height:auto; border:1px solid rgba(15,23,42,0.12); border-radius:8px; background:white;" />'
+            "</div>"
+        )
+        for payload in payloads
+    )
+    footer_note = ""
+    if rendered_count < page_total:
+        footer_note = (
+            f'<div style="padding:8px 4px 2px 4px; color:#475569; font-size:12px; text-align:center;">'
+            f"Showing {rendered_count} of {page_total} page(s). Download the PDF for the complete document."
+            "</div>"
+        )
     return (
-        f'<div style="height:{height}px; overflow:auto; border:1px solid rgba(128,128,128,0.2); border-radius:10px; background:#fff;">'
-        f'<object data="data:application/pdf;base64,{encoded}" type="application/pdf" '
-        f'width="100%" height="{max(height - 8, 240)}" style="display:block;">'
-        f'<embed src="data:application/pdf;base64,{encoded}" type="application/pdf" width="100%" height="{max(height - 8, 240)}"></embed>'
-        "</object>"
-        "</div>"
+        f'<div style="height:{height}px; overflow-y:auto; padding:12px; border:1px solid rgba(128,128,128,0.2); '
+        'border-radius:10px; background:#ffffff;">'
+        f"{images_html}{footer_note}</div>"
     )
 
 
@@ -966,10 +914,18 @@ def render_pdf_resource_popover(
             st.caption(f"Linked artifact path: `{asset_path}`")
         if pdf_path and pdf_path.exists():
             try:
-                previews, page_total = render_pdf_preview(pdf_path, max_pages=3)
+                components.html(
+                    pdf_scroll_preview_html(pdf_path, height=440, max_pages=3, scale=1.05),
+                    height=460,
+                    scrolling=False,
+                )
+                _, page_total = render_pdf_page_payloads(
+                    str(pdf_path),
+                    pdf_path.stat().st_mtime_ns,
+                    scale=1.05,
+                    max_pages=3,
+                )
                 st.caption(f"PDF preview · {page_total} page(s)")
-                for page_number, preview in enumerate(previews, start=1):
-                    st.image(preview, caption=f"Page {page_number}", width="stretch")
             except Exception as exc:
                 st.info("Inline PDF preview is unavailable for this evidence item. Use the download action below.")
                 with st.expander("Preview diagnostic", expanded=False):
@@ -1584,169 +1540,6 @@ async def run_gpt_researcher(
     }
 
 
-def clean_latex_response(text: str) -> str:
-    clean = text.strip()
-    clean = re.sub(r"^```(?:latex|tex)?\s*", "", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"\s*```$", "", clean)
-    match = re.search(r"\\documentclass[\s\S]*?\\end\{document\}", clean)
-    if match:
-        return match.group(0).strip() + "\n"
-    return clean.strip() + "\n"
-
-
-def structurally_validate_latex(source: str) -> str | None:
-    required_tokens = [
-        "\\documentclass",
-        "\\begin{document}",
-        "\\end{document}",
-    ]
-    for token in required_tokens:
-        if token not in source:
-            return f"Missing required LaTeX token: {token}"
-    if source.find("\\begin{document}") > source.find("\\end{document}"):
-        return "The document body markers are out of order."
-    return None
-
-
-def validate_latex_candidate(candidate_source: str, paths: RuntimePaths) -> tuple[bool, str]:
-    structural_issue = structurally_validate_latex(candidate_source)
-    if structural_issue:
-        return False, structural_issue
-
-    if shutil.which("pdflatex") is None:
-        return True, "pdflatex not available; structural validation only."
-
-    temp_name = f".{paths.paper_tex.stem}.ai_validation.tex"
-    temp_source_path = paths.paper_tex.parent / temp_name
-    output_dir_path: Path | None = None
-    try:
-        atomic_write_text(temp_source_path, candidate_source)
-        with tempfile.TemporaryDirectory(prefix="latex-validate-") as tmpdir:
-            output_dir_path = Path(tmpdir)
-            command = [
-                "pdflatex",
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                f"-output-directory={tmpdir}",
-                temp_name,
-            ]
-            result = subprocess.run(
-                command,
-                cwd=str(paths.paper_tex.parent),
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=False,
-            )
-            if result.returncode != 0:
-                log = (result.stdout or "") + "\n" + (result.stderr or "")
-                return False, log.strip()[-4000:]
-            return True, "Validation compile succeeded."
-    except subprocess.TimeoutExpired as exc:
-        return False, f"LaTeX validation timed out: {exc}"
-    finally:
-        try:
-            temp_source_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if output_dir_path is not None:
-            for suffix in (".aux", ".log", ".out", ".pdf", ".toc"):
-                try:
-                    (output_dir_path / f"{Path(temp_name).stem}{suffix}").unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-
-def modify_latex_source(current_source: str, instruction: str, settings: dict[str, Any], paths: RuntimePaths) -> str:
-    system_prompt = (
-        "You are a careful LaTeX co-author working on a scientific paper. "
-        "You must read the entire source before editing it. "
-        "Apply the user request directly to the provided source and return only one complete compilable LaTeX document, "
-        "from \\documentclass through \\end{document}. "
-        "Do not omit sections, packages, macros, bibliography commands, labels, or environments unless the user explicitly asks for removal. "
-        "Keep indentation tidy, preserve existing structure where possible, and never add markdown fences or explanations."
-    )
-    validation_feedback = ""
-    for attempt in range(1, 3):
-        user_prompt = (
-            f"User modification request:\n{instruction}\n\n"
-            "Current full LaTeX source to edit:\n"
-            f"{current_source}"
-        )
-        if validation_feedback:
-            user_prompt += (
-                "\n\nThe previous LaTeX candidate failed validation. "
-                "Repair it and return a corrected full document only.\n"
-                f"Validation feedback:\n{validation_feedback}"
-            )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        candidate = clean_latex_response(llm_complete(messages, settings))
-        is_valid, feedback = validate_latex_candidate(candidate, paths)
-        if is_valid:
-            return candidate
-        validation_feedback = feedback
-
-    raise RuntimeError(
-        "The model returned LaTeX that failed validation twice.\n\n"
-        f"Validation feedback:\n{validation_feedback}"
-    )
-
-
-def compile_latex(paths: RuntimePaths) -> dict[str, Any]:
-    if shutil.which("pdflatex") is None:
-        return {"ok": False, "log": "pdflatex was not found on PATH. Install a TeX distribution such as TeX Live."}
-
-    paths.compiled_output.mkdir(parents=True, exist_ok=True)
-    command = [
-        "pdflatex",
-        "-interaction=nonstopmode",
-        f"-output-directory={str(paths.compiled_output)}",
-        paths.paper_tex.name,
-    ]
-    combined_log: list[str] = []
-    ok = True
-    for run_number in range(1, 3):
-        try:
-            result = subprocess.run(
-                command,
-                cwd=str(paths.paper_tex.parent),
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=False,
-            )
-            combined_log.append(f"===== pdflatex run {run_number} =====\n{result.stdout}\n{result.stderr}")
-            if result.returncode != 0:
-                ok = False
-        except subprocess.TimeoutExpired as exc:
-            ok = False
-            combined_log.append(f"===== pdflatex run {run_number} timed out =====\n{exc}")
-            break
-
-    pdf_path = paths.compiled_output / f"{paths.paper_tex.stem}.pdf"
-    if not pdf_path.exists():
-        ok = False
-
-    log_path = paths.compiled_output / f"{paths.paper_tex.stem}.log"
-    if log_path.exists():
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        important = "\n".join(line for line in log_text.splitlines() if line.startswith("!") or "Error" in line)
-        if important:
-            combined_log.append(f"===== TeX error highlights =====\n{important}")
-
-    return {"ok": ok, "pdf_path": pdf_path, "log": "\n\n".join(combined_log)}
-
-
-def save_editor_if_changed(paths: RuntimePaths) -> None:
-    current_text = st.session_state.get("latex_editor", "")
-    current_sha = sha256_text(current_text)
-    if current_sha != st.session_state.get("latex_saved_sha"):
-        atomic_write_text(paths.paper_tex, current_text)
-        st.session_state["latex_saved_sha"] = current_sha
-
 
 def safe_toast(message: str) -> None:
     try:
@@ -1760,6 +1553,7 @@ def read_json_file(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
 
 
 def sync_chat_session_from_db(database_path: Path, case_id: int) -> None:
@@ -1808,30 +1602,6 @@ def case_graph_rows(case_record: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def case_latex_rows(case_record: Any) -> list[dict[str, Any]]:
-    paths = case_paths(case_record)
-    rows: list[dict[str, Any]] = []
-    paper_path = paths["paper_tex"]
-    if paper_path.exists():
-        rows.append(
-            {
-                "artifact": paper_path.name,
-                "type": "source",
-                "modified": datetime.fromtimestamp(paper_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-            }
-        )
-    compiled_root = paths["compiled_output"]
-    if compiled_root.exists():
-        for pdf_path in sorted(compiled_root.glob("*.pdf")):
-            rows.append(
-                {
-                    "artifact": pdf_path.name,
-                    "type": "compiled_pdf",
-                    "modified": datetime.fromtimestamp(pdf_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                }
-            )
-    return rows
-
 
 def render_login_screen() -> None:
     _, center, _ = st.columns([0.22, 0.56, 0.22])
@@ -1858,7 +1628,6 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
     staged_pdfs = discover_pdfs(selected_paths["bib_pdf"])
     report_rows = case_report_rows(selected_case)
     graph_rows = case_graph_rows(selected_case)
-    latex_rows = case_latex_rows(selected_case)
     sync_event = latest_sync_event(database_path, selected_case.id)
 
     st.title("Welcome")
@@ -1883,12 +1652,11 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
             except Exception as exc:
                 st.error(f"MinIO sync failed: {exc}")
 
-    metrics = st.columns(5)
+    metrics = st.columns(4)
     metrics[0].metric("Cases", len(all_cases))
     metrics[1].metric("Staged PDFs", len(staged_pdfs))
     metrics[2].metric("Reports", len(report_rows))
     metrics[3].metric("Graph docs", len(graph_rows))
-    metrics[4].metric("LaTeX artifacts", len(latex_rows))
 
     with st.container(border=True):
         st.markdown(f"### Active Case: {selected_case.name}")
@@ -1926,12 +1694,6 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
         else:
             st.info("No deep-search reports found for this case.")
 
-        st.markdown("### LaTeX Representations")
-        if latex_rows:
-            st.dataframe(latex_rows, width="stretch", hide_index=True)
-        else:
-            st.info("No LaTeX source or compiled PDF was found for this case.")
-
     with preview_right:
         st.markdown("### Graph Artifacts")
         if graph_rows:
@@ -1947,8 +1709,6 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
                     f"bib_pdf: {selected_paths['bib_pdf']}",
                     f"multimodal_store: {selected_paths['multimodal_store']}",
                     f"graph_store: {selected_paths['graph_store']}",
-                    f"compiled_output: {selected_paths['compiled_output']}",
-                    f"paper_tex: {selected_paths['paper_tex']}",
                 ]
             ),
             language="text",
@@ -1957,7 +1717,7 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
 
 def render_new_case_page(database_path: Path, root: Path) -> None:
     st.title("Create A New Case")
-    st.write("Each case gets its own PDF staging area, multimodal index store, graph store, compile output, and LaTeX source.")
+    st.write("Each case gets its own PDF staging area, multimodal index store, graph store, and chat history.")
 
     with st.form("new_case_form"):
         case_name = st.text_input("Case name", value="")
@@ -2102,25 +1862,90 @@ st.markdown(
     textarea {font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;}
     .stTabs [data-baseweb="tab-list"] {gap: 0.4rem;}
     .stTabs [data-baseweb="tab"] {height: 2.6rem; padding-left: 1rem; padding-right: 1rem;}
+    .rag-chat-hero {
+        border: 1px solid rgba(128, 128, 128, 0.18);
+        border-radius: 18px;
+        padding: 1rem 1.1rem;
+        margin: 0.5rem 0 1rem 0;
+        background: linear-gradient(180deg, rgba(20, 24, 33, 0.98), rgba(13, 17, 25, 0.98));
+    }
+    .rag-chat-hero-title {
+        font-size: 1.02rem;
+        font-weight: 750;
+        color: #f8fafc;
+        margin-bottom: 0.2rem;
+    }
+    .rag-chat-hero-copy {
+        color: rgba(203, 213, 225, 0.86);
+        font-size: 0.86rem;
+        line-height: 1.5;
+        margin: 0;
+    }
+    .st-key-rag_chat_surface {
+        border: 1px solid rgba(128, 128, 128, 0.14);
+        border-radius: 18px;
+        background:
+            linear-gradient(180deg, rgba(9, 13, 20, 0.82), rgba(8, 11, 18, 0.96));
+        padding: 0.75rem 0.9rem;
+    }
     div[data-testid="stChatMessage"] {
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 12px;
-        padding: 0.65rem 0.9rem;
-        margin-bottom: 0.65rem;
-        background: var(--secondary-background-color);
+        border: 1px solid rgba(128, 128, 128, 0.18);
+        border-radius: 18px;
+        padding: 0.95rem 1.05rem;
+        margin: 0.85rem 0;
+        background: rgba(17, 24, 39, 0.92);
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16);
+        overflow: hidden;
+    }
+    div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+        margin-left: auto;
+        max-width: min(760px, 86%);
+        background: linear-gradient(135deg, rgba(38, 72, 132, 0.95), rgba(28, 47, 87, 0.95));
+        border-color: rgba(96, 165, 250, 0.24);
+    }
+    div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
+        margin-right: auto;
+        max-width: min(1040px, 100%);
+        border-color: rgba(148, 163, 184, 0.18);
+    }
+    div[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
+        overflow-x: auto;
     }
     div[data-testid="stChatMessage"] table {
         width: 100%;
+        min-width: 620px;
         font-size: 0.92rem;
+        border-collapse: collapse;
+        overflow: hidden;
+        border-radius: 10px;
+    }
+    div[data-testid="stChatMessage"] th {
+        background: rgba(148, 163, 184, 0.12);
+        color: #f8fafc;
+        font-weight: 700;
     }
     div[data-testid="stChatMessage"] th, div[data-testid="stChatMessage"] td {
-        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-        padding: 0.42rem 0.5rem;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+        padding: 0.52rem 0.62rem;
         vertical-align: top;
     }
     div[data-testid="stChatMessage"] pre {
-        border-radius: 8px;
+        border-radius: 12px;
         border: 1px solid rgba(128, 128, 128, 0.22);
+        background: rgba(5, 8, 14, 0.9) !important;
+    }
+    .rag-mode-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.22rem 0.58rem;
+        border-radius: 999px;
+        border: 1px solid rgba(96, 165, 250, 0.22);
+        color: #bfdbfe;
+        background: rgba(96, 165, 250, 0.1);
+        font-size: 0.74rem;
+        font-weight: 700;
+        margin-bottom: 0.45rem;
     }
     .st-key-multimodal_chat_input {
         position: sticky;
@@ -2410,8 +2235,6 @@ with st.sidebar:
         bib_pdf_raw = st.text_input("PDF staging directory", value=str(managed_paths["bib_pdf"]), disabled=True)
         multimodal_store_raw = st.text_input("Multimodal store directory", value=str(managed_paths["multimodal_store"]), disabled=True)
         graph_store_raw = st.text_input("Graph store directory", value=str(managed_paths["graph_store"]), disabled=True)
-        compiled_output_raw = st.text_input("Compile output directory", value=str(managed_paths["compiled_output"]), disabled=True)
-        paper_tex_raw = st.text_input("LaTeX source path", value=str(managed_paths["paper_tex"]), disabled=True)
         if st.button("Sync Current Case To MinIO", width="stretch"):
             with st.spinner("Uploading this case to MinIO..."):
                 try:
@@ -2470,13 +2293,10 @@ settings = {
 
 paths = RuntimePaths(
     bib_pdf=resolve_workspace_path(bib_pdf_raw),
-    compiled_output=resolve_workspace_path(compiled_output_raw),
-    paper_tex=resolve_workspace_path(paper_tex_raw),
 )
 multimodal_store_path = resolve_workspace_path(multimodal_store_raw)
 graph_store_path = resolve_workspace_path(graph_store_raw)
-created_paper = ensure_bootstrap_files(paths, workspace_title)
-sync_latex_session(paths.paper_tex)
+ensure_bootstrap_files(paths)
 missing_modules = missing_runtime_modules(settings)
 
 if st.session_state.get("app_view") == "home":
@@ -2487,12 +2307,10 @@ if st.session_state.get("app_view") == "new_case":
     st.stop()
 
 st.title(workspace_title)
-st.caption(f"Active model: {settings['backend']} / {settings['model']} | Paper: {paths.paper_tex.relative_to(ROOT) if paths.paper_tex.is_relative_to(ROOT) else paths.paper_tex}")
+st.caption(f"Active model: {settings['backend']} / {settings['model']}")
 st.caption(
     f"Case `{selected_case.slug}` | GPT Researcher `{GPT_RESEARCHER_ENGINE_PATH}` | Multimodal store `{multimodal_store_path}` | Retriever `{effective_retriever(settings)}`"
 )
-if created_paper:
-    safe_toast(f"Initialized {paths.paper_tex.name}")
 if missing_modules:
     st.error(
         "Missing runtime modules: "
@@ -2500,11 +2318,10 @@ if missing_modules:
         + ". Install the updated requirements and restart Streamlit."
     )
 
-tab_search, tab_chat, tab_latex = st.tabs(
+tab_search, tab_chat = st.tabs(
     [
         "Deep Search & Multimodal Indexing",
         "Agentic Multimodal RAG Chat",
-        "Live LaTeX Studio & Local Compiling",
     ]
 )
 maybe_switch_workspace_tab()
@@ -2855,10 +2672,18 @@ with tab_chat:
             st.rerun()
 
     st.divider()
-    st.markdown("### Workspace Cross-Examination")
-    st.caption(
-        f"Query backend: Qdrant `{multimodal_store_path}` | generation: "
-        f"{settings['backend']} / `{settings['model']}` | embeddings `{settings['multimodal_embed_model']}`"
+    st.markdown(
+        f"""
+        <div class="rag-chat-hero">
+          <div class="rag-chat-hero-title">Agentic Multimodal RAG Chat</div>
+          <p class="rag-chat-hero-copy">
+            Query the active case with either fast Qdrant-backed Standard RAG or graph-backed Research Mode.
+            Generation uses {html.escape(settings['backend'])} / <code>{html.escape(settings['model'])}</code>; embeddings use
+            <code>{html.escape(settings['multimodal_embed_model'])}</code>.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     if "chat_messages" not in st.session_state:
@@ -2877,8 +2702,6 @@ with tab_chat:
         st.session_state["chat_pending_mode"] = st.session_state.get("chat_mode", "standard")
         clear_case_chat_history(APP_DB_PATH, selected_case.id)
         st.rerun()
-
-    st.markdown("**Ask the indexed workspace**")
 
     queued_question = st.session_state.get("chat_pending_question", "").strip()
     if queued_question:
@@ -2946,19 +2769,23 @@ with tab_chat:
         maybe_auto_sync_case(APP_DB_PATH, selected_case)
         st.rerun()
 
-    for message in st.session_state["chat_messages"]:
-        with st.chat_message(message["role"]):
-            if message["role"] == "assistant" and message.get("mode") == "research":
-                st.caption("Research Mode")
-            render_markdown_block(message["content"])
-            if message.get("evidence"):
-                render_evidence_resources(
-                    message["evidence"],
-                    bib_pdf_dir=paths.bib_pdf,
-                    key_prefix=f"chat_evidence_{abs(hash(message['content']))}",
-                )
-            if message.get("artifacts"):
-                render_artifacts(message["artifacts"])
+    with st.container(key="rag_chat_surface", border=False, height=650):
+        if not st.session_state["chat_messages"]:
+            st.info("Ask a question after indexing the case. Evidence, PDF references, tables, and figures will appear inline with each answer.")
+        for index, message in enumerate(st.session_state["chat_messages"]):
+            with st.chat_message(message["role"]):
+                if message["role"] == "assistant":
+                    mode_label = "Research Mode" if message.get("mode") == "research" else "Standard RAG"
+                    st.markdown(f'<span class="rag-mode-pill">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
+                render_markdown_block(message["content"])
+                if message.get("evidence"):
+                    render_evidence_resources(
+                        message["evidence"],
+                        bib_pdf_dir=paths.bib_pdf,
+                        key_prefix=f"chat_evidence_{index}_{abs(hash(message['content']))}",
+                    )
+                if message.get("artifacts"):
+                    render_artifacts(message["artifacts"])
 
     pending_question = st.chat_input(
         "Ask a high-precision question about papers, datasets, methods, tables, and figures...",
@@ -2994,82 +2821,3 @@ with tab_chat:
         st.session_state["chat_pending_question"] = pending_question
         st.session_state["chat_pending_mode"] = st.session_state.get("chat_mode", "standard")
         st.rerun()
-
-
-with tab_latex:
-    st.subheader("AI Co-Author")
-    modify_instruction = st.text_area(
-        "Ask AI to modify your active LaTeX source directly",
-        height=115,
-    )
-
-    if st.button("Apply AI Edit To Source", type="primary", width="stretch"):
-        save_editor_if_changed(paths)
-        preflight_issues = runtime_preflight(settings, paths, require_paper=True)
-        if preflight_issues:
-            st.error("\n".join(f"- {issue}" for issue in preflight_issues))
-        elif not modify_instruction.strip():
-            st.warning("Enter an editing instruction first.")
-        else:
-            with st.spinner("The co-author is rewriting the LaTeX source..."):
-                try:
-                    updated = modify_latex_source(st.session_state["latex_editor"], modify_instruction.strip(), settings, paths)
-                    atomic_write_text(paths.paper_tex, updated)
-                    st.session_state["latex_editor"] = updated
-                    st.session_state["latex_saved_sha"] = sha256_text(updated)
-                    safe_toast("LaTeX source updated")
-                    st.rerun()
-                except Exception as exc:
-                    st.error("AI edit failed.")
-                    st.code(str(exc), language="text")
-
-    compile_result = st.session_state.get("latex_last_compile_result")
-    if st.button("🚀 Compile Document", type="primary", width="stretch"):
-        save_editor_if_changed(paths)
-        with st.spinner("Running pdflatex twice..."):
-            compile_result = compile_latex(paths)
-        st.session_state["latex_last_compile_result"] = compile_result
-        if compile_result["ok"]:
-            st.success(f"Compilation succeeded: {compile_result['pdf_path']}")
-            synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
-            if sync_error:
-                st.warning(f"MinIO sync skipped after compilation: {sync_error}")
-            elif synced:
-                st.caption("MinIO sync completed for the compiled LaTeX artifacts.")
-        else:
-            st.error("Compilation failed.")
-
-    source_col, preview_col = st.columns([1.08, 0.92], gap="large")
-    with source_col:
-        st.text_area("Active LaTeX source", key="latex_editor", height=760)
-        save_editor_if_changed(paths)
-
-    with preview_col:
-        st.subheader("PDF Preview")
-        st.write(f"Source: `{paths.paper_tex}`")
-        st.write(f"Output: `{paths.compiled_output}`")
-        pdf_path = paths.compiled_output / f"{paths.paper_tex.stem}.pdf"
-        if pdf_path.exists():
-            try:
-                components.html(pdf_embed_html(pdf_path, height=760), height=780, scrolling=True)
-                st.caption("Scrollable PDF viewer")
-            except Exception:
-                previews, page_total = render_pdf_preview(pdf_path, max_pages=3)
-                st.caption(f"Compiled PDF · {page_total} page(s)")
-                for page_number, preview in enumerate(previews, start=1):
-                    st.image(preview, caption=f"Page {page_number}", width="stretch")
-            st.download_button(
-                "Download compiled PDF",
-                data=pdf_path.read_bytes(),
-                file_name=pdf_path.name,
-                mime="application/pdf",
-                width="stretch",
-            )
-        else:
-            st.info("Compile the document to see the PDF preview here.")
-
-        if compile_result and not compile_result.get("ok"):
-            st.code(compile_result.get("log", ""), language="text")
-        elif compile_result and compile_result.get("log"):
-            with st.expander("Compilation log", expanded=False):
-                st.code(compile_result.get("log", ""), language="text")
