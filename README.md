@@ -2,40 +2,35 @@
 
 ![DeepSciPaper Banner](asset/Gemini_Generated_Image_vof9oxvof9oxvof9.png)
 
-DeepSciPaper is a case-based scientific research workspace for:
+DeepSciPaper is a case-based scientific research copilot for students and researchers who need to discover literature, index papers locally, inspect artifacts, and discuss evidence with a grounded AI assistant.
+
+It focuses on four workflows:
 
 - agentic deep literature search
 - multimodal PDF parsing and indexing
-- graph-backed and vector-backed RAG
-- evidence-grounded chat
-- LaTeX co-authoring and local compilation
-- case persistence with SQLite
-- artifact backup to MinIO
+- Standard RAG over local Qdrant evidence
+- graph-backed Research Mode for higher-rigor scientific answers
 
-The app is built around one idea: a study should be reproducible, inspectable, and portable. Every case keeps its own PDFs, multimodal store, graph store, compiled outputs, and chat history.
-
+The app is built around one practical idea: every research case should be reproducible, inspectable, and portable. Each case keeps its own PDFs, multimodal store, graph store, chat history, and optional MinIO backup.
 
 ### Demo 1
+
 <p align="center">
   <img src="asset/demo 1.gif" alt="App Demo" width="90%">
 </p>
 
-
-
 ## Current Product Surface
 
-DeepSciPaper now includes:
+DeepSciPaper includes:
 
 - login screen with demo credentials
 - home page with case overview
 - case creation and switching
 - Deep Search workspace
 - Agentic Multimodal RAG Chat workspace
-- Live LaTeX Studio
 - SQLite-backed app state
 - optional MinIO artifact sync
-
-The app is case-first: every workflow runs inside the active study, and a successful indexing run now finishes by building both the multimodal vector store and the graph-RAG artifacts needed for Research Mode.
+- automatic graph build after multimodal indexing
 
 Default login:
 
@@ -50,12 +45,10 @@ Each case lives under:
 cases/<case-slug>/
 ├── bib_pdf/
 ├── multimodal_store/
-├── scientific_graph_rag_store/
-├── compiled_output/
-└── paper.tex
+└── scientific_graph_rag_store/
 ```
 
-This means one study does not contaminate another. The active case controls what Deep Search, indexing, chat, and LaTeX work against.
+This keeps one study from contaminating another. The active case controls what Deep Search, indexing, chat, and artifact inspection work against.
 
 ## High-Level Architecture
 
@@ -74,13 +67,10 @@ flowchart TD
     J --> L[Agentic Multimodal RAG Chat]
     K --> L
     L --> M[Persist chat in SQLite]
-    B --> N[Live LaTeX Studio]
-    N --> O[compiled_output/paper.pdf]
-    D --> P[MinIO sync]
-    F --> P
-    I --> P
-    O --> P
-    M --> P
+    D --> N[MinIO sync]
+    F --> N
+    I --> N
+    M --> N
 ```
 
 ## Application Navigation
@@ -89,16 +79,14 @@ flowchart TD
 flowchart LR
     A[Login] --> B[Home]
     B --> C[New Case]
-    B --> D[Deep Search]
+    B --> D[Deep Search and Indexing]
     B --> E[Agentic Multimodal RAG Chat]
-    B --> F[Live LaTeX Studio]
     D --> E
-    E --> F
 ```
 
 ## Deep Search Workflow
 
-The Deep Search tab is intentionally narrow now:
+The Deep Search tab is intentionally focused:
 
 - deep search query
 - report type
@@ -120,26 +108,23 @@ When a search completes, the app:
 2. validates discovered links
 3. downloads reachable PDFs when available
 4. keeps the report readable in-app
-5. offers a button to jump directly to indexing/chat
+5. offers a direct path into indexing and chat
 
 ## Multimodal Indexing Workflow
 
-The indexing controls live in the **Agentic Multimodal RAG Chat** tab because that is where users actually need workspace readiness.
+The indexing controls live in the **Agentic Multimodal RAG Chat** tab because that is where users need workspace readiness.
 
-When you click **Index**, the app now performs:
+When you click **Index**, the app performs:
 
 1. MinerU parsing
 2. multimodal artifact extraction
 3. table summarization
 4. figure/image captioning
-5. mpnet embedding creation
+5. fixed mpnet embedding creation
 6. Qdrant indexing
 7. automatic scientific graph creation
 
-So indexing no longer stops at the multimodal store. At the end of a successful run, the case is ready for:
-
-- Standard RAG
-- Research Mode
+At the end of a successful run, the case is ready for both Standard RAG and Research Mode.
 
 ### Index-Time Artifact Flow
 
@@ -168,30 +153,24 @@ flowchart LR
 
 ![DeepSciPaper Standard Multimodal RAG](asset/Gemini_Generated_Image_fnipmefnipmefnip.png)
 
-The standard multimodal RAG path is still the fast lane in the product: it retrieves grounded evidence from the indexed multimodal store first, then synthesizes with the currently selected cloud or Ollama model.
-
 ## Two RAG Modes
 
-The chat tab has two retrieval modes:
+The chat tab has two retrieval modes. Both render through the same modern answer surface with markdown, tables, code blocks, evidence popovers, PDF previews, and artifact references.
 
-### 1. Standard RAG
+### Standard RAG
 
 Standard RAG is the faster path.
 
 It uses:
 
 - `multimodal_store/`
-- Qdrant retrieval
+- local Qdrant retrieval
 - evidence bundle assembly
 - synthesis with the active UI-selected model
 
-Best for:
+Best for quick grounded answers, scanning evidence fast, and iterative questioning.
 
-- quick grounded answers
-- scanning evidence fast
-- iterative questioning
-
-### 2. Research Mode
+### Research Mode
 
 Research Mode is the deeper path.
 
@@ -204,46 +183,22 @@ It uses:
 - evidence aggregation across node links
 - synthesis with the active UI-selected model
 
-Best for:
-
-- section-aware reasoning
-- table/figure/text linkage
-- more structured research answers
-- higher interpretability
-
-Both modes render through the same answer surface:
-
-- markdown answer body
-- evidence popovers
-- local PDF previews
-- table/image artifact previews
-- downloadable source files
+Best for section-aware reasoning, table/figure/text linkage, structured scientific answers, and higher interpretability.
 
 ## How Graph RAG Works
 
 Each indexed paper gets an independent knowledge graph.
 
-### Node Types
+Node types:
 
 - paper root
 - section/text node
 - table node
 - figure node
 
-### Stored Context
+Each node can contain global paper context, local section context, previous/next node information, related node links, and artifact paths.
 
-Each node contains:
-
-- global paper context
-- local section context
-- previous node
-- next node
-- related node links
-- artifact path when relevant
-
-### Relationships
-
-The graph builder creates:
+Relationships include:
 
 - `contains`
 - `next`
@@ -277,30 +232,16 @@ sequenceDiagram
 
 ## Evidence Display
 
-Evidence is meant to be inspectable, not decorative.
+Evidence is inspectable, not decorative.
 
-The app now supports:
+The app supports:
 
 - evidence popovers from chat answers
 - evidence popovers from deep-search reports
 - local PDF preview
-- figure preview when an asset path points to an image
+- figure preview when an artifact path points to an image
 - download button for the underlying PDF
 - source links in the report explorer
-
-## LaTeX Studio
-
-The LaTeX studio now behaves like a real writing surface:
-
-- AI edit controls at the top
-- compile button directly under the AI edit action
-- source editor on the left
-- scrollable PDF preview on the right
-- downloadable compiled PDF
-- compile logs below the preview
-- AI-edited LaTeX is validated before it is written back to `paper.tex`
-
-This is case-scoped, so each case has its own `paper.tex` and compiled PDF.
 
 ## SQLite Persistence
 
@@ -323,8 +264,6 @@ If configured, MinIO sync uploads:
 - `bib_pdf/`
 - `multimodal_store/`
 - `scientific_graph_rag_store/`
-- `compiled_output/`
-- `paper.tex`
 - exported case metadata
 - exported chat history
 
@@ -345,30 +284,13 @@ conda activate research_copilot
 python -m pip install -r requirements.txt
 ```
 
-### 3. Install LaTeX system packages
+### 3. Install system packages
 
-For Debian/Ubuntu:
+For Debian/Ubuntu, install the PDF and image utilities commonly needed by parsing and preview workflows:
 
 ```bash
 sudo apt update
-sudo apt install -y \
-  texlive-latex-base \
-  texlive-latex-recommended \
-  texlive-latex-extra \
-  texlive-fonts-recommended \
-  texlive-fonts-extra \
-  texlive-bibtex-extra \
-  texlive-plain-generic \
-  texlive-lang-english \
-  latexmk \
-  dvipng \
-  poppler-utils
-```
-
-If you want a fuller TeX environment:
-
-```bash
-sudo apt install -y texlive-full
+sudo apt install -y poppler-utils tesseract-ocr libgl1 libglib2.0-0
 ```
 
 ### 4. Create your environment file
@@ -433,27 +355,15 @@ http://localhost:8501
 
 1. open **Agentic Multimodal RAG Chat**
 2. click **Index**
-3. wait for:
-   - multimodal store creation
-   - Qdrant indexing
-   - graph-store build
-   - chat-ready evidence artifacts
+3. wait for multimodal store creation, Qdrant indexing, graph-store build, and chat-ready evidence artifacts
 4. ask questions immediately
 
 ### Work in chat
 
-- choose `🧠 Standard RAG` for faster answers
-- choose `🕸 Research Mode` for graph-backed answers
+- choose `Standard RAG` for faster answers
+- choose `Research Mode` for graph-backed answers
 - inspect evidence popovers
 - review PDF and figure artifacts
-
-### Write the paper
-
-1. open **Live LaTeX Studio & Local Compiling**
-2. ask AI to update the source
-3. compile
-4. inspect the PDF preview
-5. download the compiled paper
 
 ## CLI Examples
 
@@ -504,10 +414,8 @@ python scientific_graph_rag.py query \
 ## Notes On Models
 
 - Multimodal indexing uses the configured text model for table summaries and the configured image model for figure understanding.
-- Embeddings are fixed to `sentence-transformers/all-mpnet-base-v2` to avoid the NaN failures we observed with some Ollama embedding models.
-- Standard RAG and Research Mode both honor the active generation backend selected in the UI:
-  - local Ollama
-  - cloud OpenAI-compatible providers
+- Embeddings are fixed to `sentence-transformers/all-mpnet-base-v2` to avoid NaN failures observed with some Ollama embedding models.
+- Standard RAG and Research Mode both honor the active generation backend selected in the UI: local Ollama or cloud OpenAI-compatible providers.
 
 ## Main Files
 
@@ -520,15 +428,4 @@ python scientific_graph_rag.py query \
 
 ## Current State
 
-This branch is the case-managed workspace branch with:
-
-- login
-- home page
-- case management
-- SQLite persistence
-- MinIO sync hooks
-- automatic graph build after multimodal indexing
-- dual RAG modes
-- LaTeX PDF preview
-
-That gives you one app surface for research discovery, structured indexing, graph reasoning, and manuscript production.
+This branch is the case-managed research workspace with login, case management, SQLite persistence, MinIO sync hooks, automatic graph build after multimodal indexing, and dual RAG chat modes. The product is focused on discovery, indexing, evidence inspection, and research chat.
