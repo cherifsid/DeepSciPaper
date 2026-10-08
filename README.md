@@ -329,6 +329,17 @@ This makes a study portable beyond the local machine.
 
 ## Installation
 
+Clone the single repository; the modified GPT Researcher backend is included
+as ordinary files under `engines/gpt-researcher/`:
+
+```bash
+git clone https://github.com/cherifsid/DeepSciPaper.git
+cd DeepSciPaper
+```
+
+No submodule initialization or separate backend repository is required. Backend
+changes are committed and pushed together with the application.
+
 ### 1. Create environment
 
 ```bash
