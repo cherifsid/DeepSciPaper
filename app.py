@@ -23,6 +23,9 @@ from urllib.parse import unquote, urlparse
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from research_planning import planner_prompt, parse_search_plan
+from chat_policy import evaluate_question
+from chat_formatting import answer_blocks
 
 from case_management import (
     append_chat_message as persist_chat_message,
@@ -747,26 +750,29 @@ def summarize_multimodal_results(results: list[dict[str, Any]]) -> list[dict[str
     return rows
 
 
-def render_artifacts(artifact_references: list[dict[str, Any]]) -> None:
+def render_artifacts(artifact_references: list[dict[str, Any]], key_prefix: str = "artifact") -> None:
     if not artifact_references:
         return
-    with st.expander("Image and table artifacts", expanded=False):
-        st.dataframe(artifact_references, width="stretch", hide_index=True)
-        image_refs = [
-            item
-            for item in artifact_references
-            if (item.get("modality") == "image" or item.get("node_type") == "figure") and item.get("asset_path")
-        ]
-        if image_refs:
-            image_cols = st.columns(2)
-            for index, item in enumerate(image_refs[:8]):
-                path = Path(str(item.get("asset_path", "")))
-                if path.exists():
-                    image_cols[index % 2].image(
-                        str(path),
-                        caption=f"{item.get('source_pdf_name', '')} | {item.get('title', '')}",
-                        width="stretch",
-                    )
+    with st.expander(f"Figures and tables ({len(artifact_references)})", expanded=False):
+        for index, item in enumerate(artifact_references):
+            title = item.get("title") or item.get("source_pdf_name") or f"Artifact {index + 1}"
+            st.markdown(f"**{title}**")
+            st.caption(str(item.get("source_pdf_name") or ""))
+            path = Path(str(item.get("asset_path") or ""))
+            if not path.is_file():
+                st.caption("This artifact is unavailable locally.")
+                continue
+            try:
+                if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                    st.image(str(path), width="stretch")
+                elif path.suffix.lower() in {".md", ".txt"}:
+                    render_markdown_block(path.read_text(encoding="utf-8"))
+                st.download_button("Download artifact", path.read_bytes(), file_name=path.name,
+                                   key=f"{key_prefix}_{index}", icon=":material/download:", on_click="ignore")
+            except (OSError, UnicodeError):
+                st.caption("This artifact could not be opened.")
+            if index < len(artifact_references) - 1:
+                st.divider()
 
 
 def clean_markdown_for_display(text: str) -> str:
@@ -845,6 +851,53 @@ def render_pdf_preview(pdf_path: Path, max_pages: int = 2) -> tuple[list[bytes],
             pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
             previews.append(pix.tobytes("png"))
     return previews, page_total
+
+
+def mount_chat_composer() -> None:
+    # Measure the content column instead of guessing sidebar widths or offsets.
+    components.html("""
+    <script>
+    const win = window.parent, doc = win.document;
+    if (win.__ragDockCleanup) win.__ragDockCleanup();
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const workspace = doc.querySelector('.st-key-rag_workspace');
+      const composer = doc.querySelector('.st-key-rag_composer');
+      if (!workspace || !composer) return;
+      const visible = workspace.getClientRects().length > 0 && workspace.offsetWidth > 0;
+      if (!visible) { composer.style.visibility = 'hidden'; return; }
+      const rect = workspace.getBoundingClientRect();
+      Object.assign(composer.style, {
+        position: 'fixed', bottom: '0px', left: rect.left + 'px',
+        width: rect.width + 'px', zIndex: '50', visibility: 'visible',
+        boxSizing: 'border-box'
+      });
+      workspace.style.setProperty('--rag-dock-height', (composer.offsetHeight + 32) + 'px');
+    };
+    const schedule = () => { if (!frame) frame = win.requestAnimationFrame(update); };
+    const resize = new ResizeObserver(schedule);
+    const workspace = doc.querySelector('.st-key-rag_workspace');
+    const composer = doc.querySelector('.st-key-rag_composer');
+    if (workspace) resize.observe(workspace);
+    if (composer) resize.observe(composer);
+    const mutations = new MutationObserver(schedule);
+    mutations.observe(doc.body, {subtree:true, childList:true, attributes:true,
+      attributeFilter:['hidden', 'aria-selected', 'aria-expanded']});
+    win.addEventListener('resize', schedule);
+    doc.addEventListener('scroll', schedule, true);
+    win.__ragDockCleanup = () => {
+      resize.disconnect(); mutations.disconnect(); win.cancelAnimationFrame(frame);
+      win.removeEventListener('resize', schedule);
+      doc.removeEventListener('scroll', schedule, true);
+    };
+    const cleanup = win.__ragDockCleanup;
+    window.addEventListener('unload', () => {
+      if (win.__ragDockCleanup === cleanup) { cleanup(); delete win.__ragDockCleanup; }
+    }, {once:true});
+    schedule();
+    </script>
+    """, height=0, width=0)
 
 
 def request_workspace_tab_switch(tab_name: str) -> None:
@@ -1092,7 +1145,8 @@ def multimodal_chat_answer(
         "1. Cite factual claims with evidence IDs like [E1], [E2].\n"
         "2. Mention table/image artifacts only when present in evidence.\n"
         "3. If evidence is insufficient or conflicting, say so explicitly.\n"
-        "4. Keep output as clean Markdown with concise sections.\n\n"
+        "4. Keep output as clean Markdown with concise sections.\n"
+        "5. Put code in fenced blocks with a language tag; distinguish proposed implementations from source code in papers.\n\n"
         f"Question:\n{question}\n\n"
         f"Retrieved evidence:\n{evidence_text}"
     )
@@ -1261,13 +1315,145 @@ def append_verified_sources(report: str, validated_sources: list[dict[str, Any]]
     return report.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
 
+REPORT_ROLE_NOISE_PATTERN = re.compile(
+    r"\b(?:[A-Z]+(?:/[A-Z]+)*_role|RESEARCHER_ROLE|RESEARCH/MANAGING_role|MANAGING_role)\b",
+    re.IGNORECASE,
+)
+
+
+def report_quality_issue(report: str) -> str:
+    text = html.unescape(report or "")
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return "The report is empty."
+    role_hits = REPORT_ROLE_NOISE_PATTERN.findall(compact)
+    if len(role_hits) >= 12:
+        return "The report contains repeated internal role labels, which indicates LLM output degeneration."
+    if re.search(r"(?:\b[A-Z_/]{5,}_role:?\s*){8,}", compact, flags=re.IGNORECASE):
+        return "The report contains a repeated role-token loop, which indicates LLM output degeneration."
+    words = re.findall(r"[A-Za-z][A-Za-z_/:-]{2,}", compact[:12000])
+    if len(words) >= 240:
+        unique_ratio = len(set(word.lower() for word in words)) / max(len(words), 1)
+        most_common = max((words.count(word) for word in set(words)), default=0)
+        if unique_ratio < 0.08 or most_common > 80:
+            return "The report is excessively repetitive and is likely not a valid research report."
+    if len(compact) > 4000 and not re.search(r"https?://|doi\.org|arxiv\.org|references|source|citation", compact, re.IGNORECASE):
+        return "The report is long but does not contain recognizable source or citation structure."
+    return ""
+
+
+def collapse_degenerate_report_for_display(report: str) -> str:
+    issue = report_quality_issue(report)
+    if not issue:
+        return report
+    urls = extract_urls(report)[:25]
+    lines = [
+        "## Report generation needs repair",
+        "",
+        issue,
+        "",
+        "The saved report contained internal model-control tokens instead of a clean final report. ",
+        "Re-run Deep Search with a lower temperature or a stronger report-writing model. The app now blocks this failure mode for new reports.",
+    ]
+    if urls:
+        lines.extend(["", "### URLs recovered from the corrupted report", ""])
+        lines.extend(f"- {url}" for url in urls)
+    return "\n".join(lines)
+
+
+def build_fallback_research_report(
+    query: str,
+    report_type: str,
+    research_result: Any,
+    validated_sources: list[dict[str, Any]],
+    source_urls: list[str],
+    research_sources: Any,
+    settings: dict[str, Any],
+) -> str:
+    source_lines = []
+    for index, source in enumerate(validated_sources[:30], start=1):
+        source_lines.append(
+            f"[{index}] {source.get('url', '')} | HTTP {source.get('status', '')} | {source.get('content_type', 'unknown')}"
+        )
+    if not source_lines:
+        for index, url in enumerate(source_urls[:30], start=1):
+            source_lines.append(f"[{index}] {url}")
+
+    context_payload = {
+        "research_result": str(research_result or "")[:24000],
+        "research_sources": str(research_sources or "")[:8000],
+        "validated_sources": source_lines[:30],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a senior scientific research analyst. Write only a clean markdown research report. "
+                "Never output internal role labels, tool traces, prompt labels, or repeated control tokens. "
+                "Use the provided context only. If evidence is weak, say so explicitly. "
+                "Preserve source traceability with numbered source references."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Research query: {query}\n"
+                f"Report type: {report_type}\n\n"
+                "Create a concise but complete markdown report with these sections:\n"
+                "# Research Report\n"
+                "## Executive Summary\n"
+                "## Key Findings\n"
+                "## Evidence Table\n"
+                "## Source Quality and Gaps\n"
+                "## Recommended Next Steps\n"
+                "## Sources Used\n\n"
+                "Available research context and sources follow as JSON. Do not invent links or citations.\n"
+                f"{json.dumps(context_payload, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+    return llm_complete(messages, settings, temperature=0.15, max_tokens=min(int(settings.get("llm_max_tokens", 5000)), 4500))
+
+
+def build_report_failure_note(
+    query: str,
+    report_type: str,
+    issue: str,
+    validated_sources: list[dict[str, Any]],
+    discovered_count: int,
+) -> str:
+    lines = [
+        "# Research Report Generation Failed Cleanliness Check",
+        "",
+        f"Query: {query}",
+        f"Report type: {report_type}",
+        "",
+        f"Reason: {issue or 'The model did not return a clean markdown report.'}",
+        "",
+        "The Deep Search crawl completed, but the final report writer produced unusable repeated role/control text. ",
+        "Use a stronger report-writing model, lower temperature, or rerun with a narrower query.",
+        "",
+        "## Verified Sources Recovered",
+        "",
+    ]
+    if validated_sources:
+        for index, source in enumerate(validated_sources, start=1):
+            lines.append(f"{index}. [{source['url']}]({source['url']}) — HTTP {source.get('status')}, `{source.get('content_type') or 'unknown'}`")
+    else:
+        lines.append("No verified sources were recovered from this run.")
+    lines.extend(["", f"Validation summary: {len(validated_sources)} reachable links from {discovered_count} discovered candidate URLs."])
+    return "\n".join(lines) + "\n"
+
+
 def build_research_role_prompt() -> str:
-    skill_pack = load_agent_skill_pack(AGENT_SKILLS_DIR)
-    return (
-        f"You are a senior scientific research agent.\n\n{skill_pack}"
-        if skill_pack
-        else "You are a senior scientific research agent. Produce evidence-grounded research reports with citations."
+    skill_pack = load_agent_skill_pack(AGENT_SKILLS_DIR, max_chars=9000)
+    base = (
+        "You are a senior scientific research agent. Produce evidence-grounded markdown reports with working citations, "
+        "source-quality notes, and clear gaps. Do not output internal role labels, prompt labels, tool traces, "
+        "or repeated tokens such as RESEARCHER_ROLE, MANAGING_role, or RESEARCH/MANAGING_role. "
+        "If sources are weak or unreachable, state that directly instead of fabricating evidence."
     )
+    return f"{base}\n\nResearch operating guidance:\n{skill_pack}" if skill_pack else base
 
 
 def build_rag_role_prompt() -> str:
@@ -1292,7 +1478,7 @@ def infer_plan_goal(query_text: str) -> str:
     lower = query_text.lower()
     if any(term in lower for term in ("dataset", "benchmark", "corpus")):
         return "Find reusable datasets, benchmarks, labels, splits, and evaluation artifacts."
-    if any(term in lower for term in ("github", "code", "repository", "reproduc")):
+    if re.search(r"\b(github|code|repository|repositories|reproduc\w*)\b", lower):
         return "Find reproducible implementations, code repositories, licenses, and released artifacts."
     if any(term in lower for term in ("pdf", "peer", "journal", "transactions", "acm", "ieee", "springer", "elsevier")):
         return "Find primary scholarly papers and accessible full-text sources."
@@ -1403,12 +1589,22 @@ def create_researcher(
 ):
     from gpt_researcher import GPTResearcher
 
+    role = build_research_role_prompt()
+    if planned_queries:
+        role += (
+            "\n\nApproved evidence collection goals:\n"
+            + json.dumps(planned_queries, ensure_ascii=False)
+            + "\nFollow these goals when collecting evidence and writing the report. "
+            "Distinguish direct task evidence from supporting methods. Do not present "
+            "supporting-task metrics as results for the requested classification task. "
+            "For each requested result without direct evidence, explicitly report the gap."
+        )
     return GPTResearcher(
         query=query,
         report_type=report_type,
         config_path=None,
         headers={"retrievers": effective_retriever(settings)},
-        role=build_research_role_prompt(),
+        role=role,
         log_handler=log_handler,
         preplanned_queries=planned_queries or [],
     )
@@ -1425,20 +1621,23 @@ async def generate_research_plan(
     if settings["backend"] == "Cloud API" and not settings.get("api_key", "").strip():
         raise RuntimeError(f"Add a {settings['cloud_provider']} API key in the sidebar before planning research.")
 
-    researcher = create_researcher(query, report_type, settings, log_handler=log_handler)
     if log_handler:
         await log_handler.on_research_step("planning_search_strategy", {"query": query})
-    if report_type == "deep" and researcher.deep_researcher:
-        plan = await researcher.deep_researcher.generate_search_queries(
-            query,
-            num_queries=int(settings.get("deep_research_breadth", 3)),
-        )
-    else:
-        plan = await researcher.research_conductor.plan_research(query, researcher.query_domains)
-    normalized = parse_plan_editor(format_plan_for_editor(plan))
-    if not normalized:
-        normalized = [{"query": query, "researchGoal": "Fallback to the original user query."}]
-    return normalized
+    messages = [
+        {"role": "system", "content": planner_prompt(datetime.now().date().isoformat())},
+        {"role": "user", "content": query},
+    ]
+    for attempt in range(2):
+        raw = await asyncio.to_thread(llm_complete, messages, settings, temperature=0.2, max_tokens=4000)
+        try:
+            return parse_search_plan(raw)
+        except (ValueError, TypeError) as exc:
+            if attempt:
+                raise RuntimeError(f"The model returned an unusable plan: {exc}. Regenerate or select another model.") from exc
+            messages.extend([
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": f"Repair the plan: {exc}. Return the required JSON with specific goals."},
+            ])
 
 
 def pdf_name_from_url(url: str, index: int) -> str:
@@ -1503,6 +1702,12 @@ async def run_gpt_researcher(
     )
     research_result = await researcher.conduct_research()
     report = await researcher.write_report()
+    initial_report_issue = report_quality_issue(report)
+    if initial_report_issue and log_handler:
+        await log_handler.on_research_step(
+            "repairing_report",
+            {"reason": initial_report_issue[:180]},
+        )
     source_urls = []
     try:
         source_urls = researcher.get_source_urls()
@@ -1521,6 +1726,34 @@ async def run_gpt_researcher(
         await log_handler.on_research_step(
             "sources_validated", {"candidate_urls": len(urls), "verified_urls": len(validated_sources)}
         )
+    if initial_report_issue:
+        try:
+            fallback_report = build_fallback_research_report(
+                query=query,
+                report_type=report_type,
+                research_result=research_result,
+                validated_sources=validated_sources,
+                source_urls=source_urls,
+                research_sources=research_sources,
+                settings=settings,
+            )
+            fallback_issue = report_quality_issue(fallback_report)
+            report = fallback_report if not fallback_issue else build_report_failure_note(
+                query,
+                report_type,
+                fallback_issue,
+                validated_sources,
+                len(urls),
+            )
+        except Exception as exc:
+            report = build_report_failure_note(
+                query,
+                report_type,
+                f"Fallback synthesis failed: {exc}",
+                validated_sources,
+                len(urls),
+            )
+
     report = append_verified_sources(report, validated_sources, len(urls))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1554,6 +1787,20 @@ def read_json_file(path: Path, default: Any) -> Any:
     except Exception:
         return default
 
+
+
+def set_navigation(view: str) -> None:
+    st.session_state["app_view"] = view
+    st.session_state["pending_navigation"] = view
+
+
+def switch_active_case() -> None:
+    st.session_state["selected_case_slug"] = st.session_state["case_picker"]
+    clear_research_plan_state()
+    reset_plan_widget_keys()
+    for key in ("selected_report_path", "suggested_chat_question", "chat_pending_question", "workspace_tab_switch"):
+        st.session_state.pop(key, None)
+    st.session_state["confirm_clear_chat"] = False
 
 
 def sync_chat_session_from_db(database_path: Path, case_id: int) -> None:
@@ -1638,10 +1885,10 @@ def render_home_page(database_path: Path, selected_case: Any, all_cases: list[An
 
     action_cols = st.columns([0.34, 0.33, 0.33])
     if action_cols[0].button("Open Deep Search Workspace", type="primary", width="stretch"):
-        st.session_state["app_view"] = "workspace"
+        set_navigation("workspace")
         st.rerun()
     if action_cols[1].button("Create New Case", width="stretch"):
-        st.session_state["app_view"] = "new_case"
+        set_navigation("new_case")
         st.rerun()
     if action_cols[2].button("Sync Current Case To MinIO", width="stretch"):
         with st.spinner("Syncing case artifacts to MinIO..."):
@@ -1737,7 +1984,7 @@ def render_new_case_page(database_path: Path, root: Path) -> None:
                 research_goal=case_goal.strip(),
             )
             st.session_state["selected_case_slug"] = new_case.slug
-            st.session_state["app_view"] = "workspace"
+            set_navigation("workspace")
             sync_chat_session_from_db(database_path, new_case.id)
             safe_toast(f"Created case: {new_case.name}")
             st.rerun()
@@ -1862,136 +2109,52 @@ st.markdown(
     textarea {font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;}
     .stTabs [data-baseweb="tab-list"] {gap: 0.4rem;}
     .stTabs [data-baseweb="tab"] {height: 2.6rem; padding-left: 1rem; padding-right: 1rem;}
-    .rag-chat-hero {
-        border: 1px solid rgba(128, 128, 128, 0.18);
-        border-radius: 18px;
-        padding: 1rem 1.1rem;
-        margin: 0.5rem 0 1rem 0;
-        background: linear-gradient(180deg, rgba(20, 24, 33, 0.98), rgba(13, 17, 25, 0.98));
-    }
-    .rag-chat-hero-title {
-        font-size: 1.02rem;
-        font-weight: 750;
-        color: #f8fafc;
-        margin-bottom: 0.2rem;
-    }
-    .rag-chat-hero-copy {
-        color: rgba(203, 213, 225, 0.86);
-        font-size: 0.86rem;
-        line-height: 1.5;
-        margin: 0;
+    .st-key-rag_workspace {
+        gap: 0 !important; min-width: 0;
+        padding-bottom: var(--rag-dock-height, 190px);
+        border-top: 1px solid rgba(128,128,128,.22);
     }
     .st-key-rag_chat_surface {
-        border: 1px solid rgba(128, 128, 128, 0.14);
-        border-radius: 18px;
-        background:
-            linear-gradient(180deg, rgba(9, 13, 20, 0.82), rgba(8, 11, 18, 0.96));
-        padding: 0.75rem 0.9rem;
+        height: auto !important; overflow: visible !important;
+        padding: 1rem 0;
     }
-    div[data-testid="stChatMessage"] {
-        border: 1px solid rgba(128, 128, 128, 0.18);
-        border-radius: 18px;
-        padding: 0.95rem 1.05rem;
-        margin: 0.85rem 0;
-        background: rgba(17, 24, 39, 0.92);
-        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16);
-        overflow: hidden;
+    .st-key-rag_chat_surface [data-testid="stChatMessage"] {
+        width: 100%; max-width: none; margin: 0 0 1.5rem;
+        background: transparent; padding: 0.5rem 0;
+        min-width: 0; border-radius: 0; flex-shrink: 0;
     }
-    div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
-        margin-left: auto;
-        max-width: min(760px, 86%);
-        background: linear-gradient(135deg, rgba(38, 72, 132, 0.95), rgba(28, 47, 87, 0.95));
-        border-color: rgba(96, 165, 250, 0.24);
+    .st-key-rag_chat_surface [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+        width: fit-content; max-width: min(820px, 90%);
+        margin: 0 0 1.25rem auto; padding: .75rem;
+        background: var(--secondary-background-color); border-radius: 8px;
     }
-    div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
-        margin-right: auto;
-        max-width: min(1040px, 100%);
-        border-color: rgba(148, 163, 184, 0.18);
+    .st-key-rag_chat_surface [data-testid="stChatMessageContent"] { min-width: 0; width: 100%; }
+    .st-key-rag_chat_surface [data-testid="stMarkdownContainer"] {
+        overflow-x: auto; overflow-wrap: anywhere; line-height: 1.75;
     }
-    div[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
-        overflow-x: auto;
+    .st-key-rag_chat_surface [data-testid="stMarkdownContainer"] p { line-height: 1.75; }
+    .st-key-rag_chat_surface h1 { font-size: 1.5rem; padding-top: .4rem; }
+    .st-key-rag_chat_surface h2 { font-size: 1.25rem; padding-top: 1rem; }
+    .st-key-rag_chat_surface h3 { font-size: 1.1rem; padding-top: .75rem; }
+    .st-key-rag_chat_surface table { width: 100%; font-size: .92rem; border-collapse: collapse; }
+    .st-key-rag_chat_surface th { background: var(--secondary-background-color); }
+    .st-key-rag_chat_surface th, .st-key-rag_chat_surface td {
+        padding: .75rem; vertical-align: top; min-width: 7rem;
+        border-bottom: 1px solid rgba(128,128,128,.22);
     }
-    div[data-testid="stChatMessage"] table {
-        width: 100%;
-        min-width: 620px;
-        font-size: 0.92rem;
-        border-collapse: collapse;
-        overflow: hidden;
-        border-radius: 10px;
-    }
-    div[data-testid="stChatMessage"] th {
-        background: rgba(148, 163, 184, 0.12);
-        color: #f8fafc;
-        font-weight: 700;
-    }
-    div[data-testid="stChatMessage"] th, div[data-testid="stChatMessage"] td {
-        border-bottom: 1px solid rgba(128, 128, 128, 0.18);
-        padding: 0.52rem 0.62rem;
-        vertical-align: top;
-    }
-    div[data-testid="stChatMessage"] pre {
-        border-radius: 12px;
-        border: 1px solid rgba(128, 128, 128, 0.22);
-        background: rgba(5, 8, 14, 0.9) !important;
-    }
-    .rag-mode-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.35rem;
-        padding: 0.22rem 0.58rem;
-        border-radius: 999px;
-        border: 1px solid rgba(96, 165, 250, 0.22);
-        color: #bfdbfe;
-        background: rgba(96, 165, 250, 0.1);
-        font-size: 0.74rem;
-        font-weight: 700;
-        margin-bottom: 0.45rem;
-    }
-    .st-key-multimodal_chat_input {
-        position: sticky;
-        bottom: 0;
-        z-index: 30;
+    .st-key-rag_composer {
+        flex: 0 0 auto !important; padding: .75rem 0;
+        border-top: 1px solid rgba(128,128,128,.22);
         background: var(--background-color);
-        padding-top: 0.45rem;
-        padding-bottom: 0.2rem;
-        border-top: 1px solid rgba(128, 128, 128, 0.18);
     }
-    .st-key-multimodal_chat_input textarea {
-        padding-right: 14.5rem !important;
-    }
-    .st-key-chat_mode_selector_inline {
-        position: relative;
-        z-index: 45;
-        margin-top: -4.0rem;
-        margin-bottom: 0.2rem;
-        height: 0;
-        pointer-events: none;
-        display: flex !important;
-        justify-content: flex-end;
-    }
-    .st-key-chat_mode_selector_inline > div {
-        pointer-events: auto;
-        display: block !important;
-        background: rgba(20, 22, 30, 0.92);
-        border: 1px solid rgba(128, 128, 128, 0.22);
-        border-radius: 999px;
-        padding: 0.18rem 0.25rem;
-        margin-right: 4.25rem !important;
-        width: fit-content !important;
-        max-width: fit-content;
-        transform: translateY(0.12rem);
-    }
-    .st-key-chat_mode_selector_inline [role="radiogroup"] {
-        gap: 0.2rem;
-        flex-wrap: nowrap !important;
-        justify-content: flex-end !important;
-    }
-    .st-key-chat_mode_selector_inline label {
-        margin-bottom: 0 !important;
-    }
-    .st-key-chat_mode_selector_inline p {
-        font-size: 0.78rem !important;
-        margin: 0 !important;
+    .st-key-rag_composer textarea { font-family: inherit !important; line-height: 1.5; }
+    .st-key-rag_composer [data-testid="stChatInput"] { position: static; }
+    .st-key-rag_toolbar { padding: .75rem 0; flex: 0 0 auto !important; }
+    .st-key-rag_chat_surface img { max-width: 100%; object-fit: contain; }
+    @media (max-width: 640px) {
+        .st-key-rag_chat_surface { padding: 1rem .25rem; }
+        .st-key-rag_composer { padding: .75rem 0; }
+        .st-key-rag_chat_surface [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) { max-width: 95%; }
     }
     </style>
     """,
@@ -2008,15 +2171,11 @@ if not st.session_state.get("is_authenticated"):
 all_cases = list_managed_cases(APP_DB_PATH)
 case_lookup = {case.slug: case for case in all_cases}
 if not all_cases:
-    fallback_case = create_managed_case(
-        APP_DB_PATH,
-        root=ROOT,
-        name="Default Study",
-        description="Auto-created workspace because no study existed yet.",
-        research_goal="Start a new case-managed study.",
-    )
-    all_cases = list_managed_cases(APP_DB_PATH)
-    case_lookup = {case.slug: case for case in all_cases}
+    st.session_state.pop("active_case_id", None)
+    st.session_state["chat_messages"] = []
+    st.info("No local studies. Create a study to begin.")
+    render_new_case_page(APP_DB_PATH, ROOT)
+    st.stop()
 else:
     fallback_case = all_cases[0]
 if "selected_case_slug" not in st.session_state or st.session_state.get("selected_case_slug") not in case_lookup:
@@ -2034,34 +2193,32 @@ with st.sidebar:
     st.title("Research Copilot")
     st.caption(f"Signed in as `{st.session_state.get('auth_user', 'admin')}`")
     top_sidebar_cols = st.columns(2)
-    if top_sidebar_cols[0].button("Home", width="stretch"):
+    if top_sidebar_cols[0].button("Home", width="stretch", on_click=set_navigation, args=("home",)):
         st.session_state["app_view"] = "home"
         st.rerun()
     if top_sidebar_cols[1].button("Logout", width="stretch"):
         st.session_state.clear()
         st.rerun()
 
-    case_options = [(case.slug, f"{case.name}{' (legacy)' if case.is_legacy else ''}") for case in all_cases]
-    selected_case_choice = st.selectbox(
-        "Active case",
-        case_options,
-        index=next((index for index, item in enumerate(case_options) if item[0] == selected_case.slug), 0),
-        format_func=lambda item: item[1],
+    case_options = [case.slug for case in all_cases]
+    if st.session_state.get("case_picker") not in case_options or st.session_state["case_picker"] != selected_case.slug:
+        st.session_state["case_picker"] = selected_case.slug
+    st.selectbox(
+        "Active case", case_options, key="case_picker",
+        format_func=lambda slug: case_lookup[slug].name,
+        on_change=switch_active_case,
     )
-    if selected_case_choice[0] != selected_case.slug:
-        st.session_state["selected_case_slug"] = selected_case_choice[0]
-        st.rerun()
-    selected_case = get_case_by_slug(APP_DB_PATH, selected_case_choice[0]) or selected_case
-
+    if "pending_navigation" in st.session_state:
+        st.session_state["navigation_view"] = st.session_state.pop("pending_navigation")
+    if st.session_state.get("navigation_view") not in {"home", "workspace", "new_case"}:
+        st.session_state["navigation_view"] = st.session_state.get("app_view", "home")
     nav_choice = st.radio(
-        "Navigation",
-        [("home", "Home"), ("workspace", "Research Workspace"), ("new_case", "New Case")],
-        index=0 if st.session_state.get("app_view", "home") == "home" else (1 if st.session_state.get("app_view") == "workspace" else 2),
-        format_func=lambda item: item[1],
+        "Navigation", ["home", "workspace", "new_case"], key="navigation_view",
+        format_func=lambda view: {"home": "Home", "workspace": "Research Workspace", "new_case": "New Case"}[view],
     )
-    st.session_state["app_view"] = nav_choice[0]
+    st.session_state["app_view"] = nav_choice
 
-    workspace_title = st.text_input("Workspace title", value=selected_case.name)
+    workspace_title = st.text_input("Workspace title", value=selected_case.name, key=f"case_title_{selected_case.id}")
     if workspace_title.strip() and workspace_title.strip() != selected_case.name:
         selected_case = update_case_metadata(
             APP_DB_PATH,
@@ -2505,7 +2662,10 @@ with tab_search:
 
     if selected_path:
         report_text = read_text_file(Path(selected_path))
-        render_markdown_block(report_text)
+        display_report_text = collapse_degenerate_report_for_display(report_text)
+        if display_report_text != report_text:
+            st.warning("This saved report contained corrupted role-token output. Showing a safe diagnostic view instead.")
+        render_markdown_block(display_report_text)
         render_report_resource_explorer(report_text, paths.bib_pdf, "report_resources")
         action_cols = st.columns([0.32, 0.68])
         if action_cols[0].button("Move To Index Page", type="primary", width="stretch"):
@@ -2531,160 +2691,142 @@ with tab_chat:
         st.error("Multimodal retrieval backend is not available.")
         st.code(str(exc), language="text")
 
-    graph_summary: dict[str, Any] = {"documents": 0}
-    try:
-        from scientific_graph_rag import load_graphs
+    graph_summary = {"documents": sum(1 for _ in (graph_store_path / "graphs").glob("*/graph.json"))}
 
-        graph_summary["documents"] = len(load_graphs(graph_store_path))
-    except Exception:
-        graph_summary["documents"] = 0
+    with st.popover("Library and indexing", icon=":material/library_books:", width="content"):
+        st.markdown("### Staging Room")
+        pdfs = discover_pdfs(paths.bib_pdf)
+        staging_metrics = st.columns(6)
+        staging_metrics[0].metric("Staged PDFs", len(pdfs))
+        staging_metrics[1].metric("Indexed docs", chat_store_summary.get("documents", 0))
+        staging_metrics[2].metric("Vector records", chat_store_summary.get("vector_records", 0))
+        staging_metrics[3].metric("Tables", chat_store_summary.get("tables", 0))
+        staging_metrics[4].metric("Images", chat_store_summary.get("images", 0))
+        staging_metrics[5].metric("Graph docs", graph_summary.get("documents", 0))
+        st.caption(f"Store: `{multimodal_store_path}` | Graph store: `{graph_store_path}`")
 
-    st.markdown("### Staging Room")
-    pdfs = discover_pdfs(paths.bib_pdf)
-    staging_metrics = st.columns(6)
-    staging_metrics[0].metric("Staged PDFs", len(pdfs))
-    staging_metrics[1].metric("Indexed docs", chat_store_summary.get("documents", 0))
-    staging_metrics[2].metric("Vector records", chat_store_summary.get("vector_records", 0))
-    staging_metrics[3].metric("Tables", chat_store_summary.get("tables", 0))
-    staging_metrics[4].metric("Images", chat_store_summary.get("images", 0))
-    staging_metrics[5].metric("Graph docs", graph_summary.get("documents", 0))
-    st.caption(f"Store: `{multimodal_store_path}` | Graph store: `{graph_store_path}`")
-
-    if pdfs:
-        st.dataframe(
-            [
-                {
-                    "file": pdf.name,
-                    "MB": round(pdf.stat().st_size / (1024 * 1024), 2),
-                    "modified": datetime.fromtimestamp(pdf.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                }
-                for pdf in pdfs
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.info(f"No PDFs found in {paths.bib_pdf}")
-
-    index_col, reset_col = st.columns([0.72, 0.28])
-    if index_col.button("Index", type="primary", width="stretch"):
-        preflight_issues = runtime_preflight(settings, paths, require_pdfs=True)
-        if preflight_issues:
-            st.error("\n".join(f"- {issue}" for issue in preflight_issues))
-        elif not pdfs:
-            st.warning("Add PDFs to the staging directory before indexing.")
-        elif ingest_pdf is None:
-            st.error("Multimodal pipeline is not available.")
+        if pdfs:
+            st.dataframe(
+                [
+                    {
+                        "file": pdf.name,
+                        "MB": round(pdf.stat().st_size / (1024 * 1024), 2),
+                        "modified": datetime.fromtimestamp(pdf.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    }
+                    for pdf in pdfs
+                ],
+                width="stretch",
+                hide_index=True,
+            )
         else:
-            results: list[dict[str, Any]] = []
-            progress = st.progress(0)
-            with st.status("Preparing multimodal indexing...", expanded=True) as status:
-                st.write(f"Found {len(pdfs)} staged PDF(s).")
-                st.write("Using MinerU parsing, multimodal enrichment, fixed mpnet embeddings, and local Qdrant indexing.")
-                for index, pdf_path in enumerate(pdfs, start=1):
-                    status.update(label=f"Indexing {index}/{len(pdfs)}: {pdf_path.name}", state="running")
-                    st.write(f"Parsing and enriching `{pdf_path.name}`...")
-                    try:
-                        result = ingest_pdf(
-                            pdf_path,
-                            store_root=multimodal_store_path,
-                            text_model=settings["multimodal_text_model"],
-                            image_model=settings["multimodal_image_model"],
-                            embed_model=settings["multimodal_embed_model"],
-                            ollama_base_url=settings["ollama_base_url"],
-                            use_mineru=True,
-                            mineru_backend=settings["mineru_backend"],
-                            mineru_method=settings["mineru_method"],
-                            mineru_lang=settings["mineru_lang"],
-                            mineru_timeout=int(settings["mineru_timeout"]),
-                            enrich_images=True,
-                            enrich_tables=True,
-                            index=True,
-                            force=True,
-                        )
-                        results.append(result)
-                        st.write(
-                            f"Indexed `{pdf_path.name}` with `{result.get('parser')}`: "
-                            f"{result.get('vector_records', 0)} vectors, {result.get('images', 0)} images."
-                        )
-                    except Exception as exc:
-                        results.append({"status": "error", "source_pdf": str(pdf_path), "error": str(exc)})
-                        st.write(f"Error indexing `{pdf_path.name}`: {exc}")
-                    progress.progress(index / len(pdfs))
-                errors = [item for item in results if item.get("status") == "error"]
-                if errors:
-                    status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
-                    st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
-                else:
-                    if build_all_graphs is not None and clean_graph_store_runtime is not None:
-                        status.update(label="Building graph RAG store...", state="running")
-                        st.write("Creating graph nodes, edges, manifests, and query-ready retrieval artifacts.")
+            st.info(f"No PDFs found in {paths.bib_pdf}")
+
+        index_col, reset_col = st.columns([0.72, 0.28])
+        if index_col.button("Index", type="primary", width="stretch"):
+            preflight_issues = runtime_preflight(settings, paths, require_pdfs=True)
+            if preflight_issues:
+                st.error("\n".join(f"- {issue}" for issue in preflight_issues))
+            elif not pdfs:
+                st.warning("Add PDFs to the staging directory before indexing.")
+            elif ingest_pdf is None:
+                st.error("Multimodal pipeline is not available.")
+            else:
+                results: list[dict[str, Any]] = []
+                progress = st.progress(0)
+                with st.status("Preparing multimodal indexing...", expanded=True) as status:
+                    st.write(f"Found {len(pdfs)} staged PDF(s).")
+                    st.write("Using MinerU parsing, multimodal enrichment, fixed mpnet embeddings, and local Qdrant indexing.")
+                    for index, pdf_path in enumerate(pdfs, start=1):
+                        status.update(label=f"Indexing {index}/{len(pdfs)}: {pdf_path.name}", state="running")
+                        st.write(f"Parsing and enriching `{pdf_path.name}`...")
                         try:
-                            clean_graph_store_runtime(graph_store_path)
-                            graph_backend = "ollama"
-                            graph_model = str(settings["multimodal_text_model"]).strip() or str(settings["model"]).strip()
-                            graph_cloud_provider = "openai"
-                            graph_api_key = ""
-                            graph_base_url = ""
-                            if settings["backend"] == "Cloud API" and settings.get("api_key", "").strip():
-                                graph_backend = "cloud"
-                                graph_model = str(settings["model"]).strip()
-                                graph_cloud_provider = "deepseek" if settings.get("cloud_provider") == "DeepSeek" else "openai"
-                                graph_api_key = settings.get("api_key", "").strip()
-                                graph_base_url = settings.get("openai_base_url", "").strip()
-                            graph_results = build_all_graphs(
-                                multimodal_store_path,
-                                graph_store_path,
-                                backend=graph_backend,
-                                model=graph_model,
+                            result = ingest_pdf(
+                                pdf_path,
+                                store_root=multimodal_store_path,
+                                text_model=settings["multimodal_text_model"],
+                                image_model=settings["multimodal_image_model"],
+                                embed_model=settings["multimodal_embed_model"],
                                 ollama_base_url=settings["ollama_base_url"],
-                                cloud_provider=graph_cloud_provider,
-                                api_key=graph_api_key,
-                                base_url=graph_base_url,
-                                enrich_root=True,
+                                use_mineru=True,
+                                mineru_backend=settings["mineru_backend"],
+                                mineru_method=settings["mineru_method"],
+                                mineru_lang=settings["mineru_lang"],
+                                mineru_timeout=int(settings["mineru_timeout"]),
+                                enrich_images=True,
+                                enrich_tables=True,
+                                index=True,
+                                force=True,
                             )
-                            st.write(f"Built {len(graph_results)} graph document package(s).")
+                            results.append(result)
+                            st.write(
+                                f"Indexed `{pdf_path.name}` with `{result.get('parser')}`: "
+                                f"{result.get('vector_records', 0)} vectors, {result.get('images', 0)} images."
+                            )
                         except Exception as exc:
-                            errors.append({"status": "error", "source_pdf": "graph_build", "error": str(exc)})
-                            st.write(f"Graph build error: {exc}")
+                            results.append({"status": "error", "source_pdf": str(pdf_path), "error": str(exc)})
+                            st.write(f"Error indexing `{pdf_path.name}`: {exc}")
+                        progress.progress(index / len(pdfs))
+                    errors = [item for item in results if item.get("status") == "error"]
                     if errors:
                         status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
                         st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
                     else:
-                        status.update(label="Multimodal index is ready", state="complete")
-                        safe_toast("Multimodal RAG index ready")
-                        st.success(f"Indexed {len(results)} PDF(s) into `{multimodal_store_path}`.")
-                        synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
-                        if sync_error:
-                            st.warning(f"MinIO sync skipped after indexing: {sync_error}")
-                        elif synced:
-                            st.caption("MinIO sync completed for the indexed study artifacts.")
-            st.dataframe(summarize_multimodal_results(results), width="stretch", hide_index=True)
+                        if build_all_graphs is not None and clean_graph_store_runtime is not None:
+                            status.update(label="Building graph RAG store...", state="running")
+                            st.write("Creating graph nodes, edges, manifests, and query-ready retrieval artifacts.")
+                            try:
+                                clean_graph_store_runtime(graph_store_path)
+                                graph_backend = "ollama"
+                                graph_model = str(settings["multimodal_text_model"]).strip() or str(settings["model"]).strip()
+                                graph_cloud_provider = "openai"
+                                graph_api_key = ""
+                                graph_base_url = ""
+                                if settings["backend"] == "Cloud API" and settings.get("api_key", "").strip():
+                                    graph_backend = "cloud"
+                                    graph_model = str(settings["model"]).strip()
+                                    graph_cloud_provider = "deepseek" if settings.get("cloud_provider") == "DeepSeek" else "openai"
+                                    graph_api_key = settings.get("api_key", "").strip()
+                                    graph_base_url = settings.get("openai_base_url", "").strip()
+                                graph_results = build_all_graphs(
+                                    multimodal_store_path,
+                                    graph_store_path,
+                                    backend=graph_backend,
+                                    model=graph_model,
+                                    ollama_base_url=settings["ollama_base_url"],
+                                    cloud_provider=graph_cloud_provider,
+                                    api_key=graph_api_key,
+                                    base_url=graph_base_url,
+                                    enrich_root=True,
+                                )
+                                st.write(f"Built {len(graph_results)} graph document package(s).")
+                            except Exception as exc:
+                                errors.append({"status": "error", "source_pdf": "graph_build", "error": str(exc)})
+                                st.write(f"Graph build error: {exc}")
+                        if errors:
+                            status.update(label=f"Indexing finished with {len(errors)} error(s)", state="error")
+                            st.error(f"Indexing finished with {len(errors)} error(s). Check terminal logs for detailed traces.")
+                        else:
+                            status.update(label="Multimodal index is ready", state="complete")
+                            safe_toast("Multimodal RAG index ready")
+                            st.success(f"Indexed {len(results)} PDF(s) into `{multimodal_store_path}`.")
+                            synced, sync_error = maybe_auto_sync_case(APP_DB_PATH, selected_case)
+                            if sync_error:
+                                st.warning(f"MinIO sync skipped after indexing: {sync_error}")
+                            elif synced:
+                                st.caption("MinIO sync completed for the indexed study artifacts.")
+                st.dataframe(summarize_multimodal_results(results), width="stretch", hide_index=True)
 
-    if reset_col.button("Reset Index", width="stretch"):
-        if clean_store is None:
-            st.error("Multimodal pipeline is not available.")
-        else:
-            clean_store(multimodal_store_path)
-            if clean_graph_store_runtime is not None:
-                clean_graph_store_runtime(graph_store_path)
-            safe_toast("Multimodal index reset")
-            st.rerun()
+        if reset_col.button("Reset Index", width="stretch"):
+            if clean_store is None:
+                st.error("Multimodal pipeline is not available.")
+            else:
+                clean_store(multimodal_store_path)
+                if clean_graph_store_runtime is not None:
+                    clean_graph_store_runtime(graph_store_path)
+                safe_toast("Multimodal index reset")
+                st.rerun()
 
-    st.divider()
-    st.markdown(
-        f"""
-        <div class="rag-chat-hero">
-          <div class="rag-chat-hero-title">Agentic Multimodal RAG Chat</div>
-          <p class="rag-chat-hero-copy">
-            Query the active case with either fast Qdrant-backed Standard RAG or graph-backed Research Mode.
-            Generation uses {html.escape(settings['backend'])} / <code>{html.escape(settings['model'])}</code>; embeddings use
-            <code>{html.escape(settings['multimodal_embed_model'])}</code>.
-          </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.caption(f"{chat_store_summary.get('documents', 0)} indexed papers | {settings['model']}")
 
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
@@ -2695,13 +2837,82 @@ with tab_chat:
     if "chat_mode" not in st.session_state:
         st.session_state["chat_mode"] = "standard"
 
-    toolbar_cols = st.columns([0.2, 0.8])
-    if toolbar_cols[0].button("Clear conversation", width="stretch"):
-        st.session_state["chat_messages"] = []
-        st.session_state["chat_pending_question"] = ""
-        st.session_state["chat_pending_mode"] = st.session_state.get("chat_mode", "standard")
-        clear_case_chat_history(APP_DB_PATH, selected_case.id)
-        st.rerun()
+    with st.container(key="rag_workspace", border=False):
+        with st.container(key="rag_toolbar"):
+            toolbar_cols = st.columns([0.65, 0.35], vertical_alignment="center")
+            toolbar_cols[0].markdown("**Conversation**")
+            with toolbar_cols[1].popover("Conversation actions", icon=":material/more_horiz:", width="stretch"):
+                transcript = "\n\n---\n\n".join(
+                    f"## {message['role'].capitalize()}\n\n{message['content']}"
+                    for message in st.session_state["chat_messages"]
+                )
+                st.download_button("Export conversation", transcript, file_name="conversation.md", mime="text/markdown",
+                                   disabled=not transcript, icon=":material/download:", on_click="ignore")
+                if st.checkbox("Clear saved messages", key="confirm_clear_chat"):
+                    if st.button("Clear conversation", type="primary"):
+                        st.session_state["chat_messages"] = []
+                        st.session_state["chat_pending_question"] = ""
+                        clear_case_chat_history(APP_DB_PATH, selected_case.id)
+                        st.rerun()
+
+        with st.container(key="rag_chat_surface", border=False):
+            if not st.session_state["chat_messages"]:
+                st.markdown("### What would you like to investigate?")
+                st.caption("Your papers, methods, and evidence.")
+                for suggestion in (
+                    "Compare the methods and evaluation datasets in these papers.",
+                    "What are the strongest findings, and which tables support them?",
+                    "Where do these papers disagree or leave unanswered questions?",
+                ):
+                    if st.button(suggestion, key=f"suggest_{suggestion}", width="stretch"):
+                        st.session_state["suggested_chat_question"] = suggestion
+            for index, message in enumerate(st.session_state["chat_messages"]):
+                with st.chat_message(message["role"]):
+                    if message["role"] == "assistant":
+                        mode_label = "Research Mode" if message.get("mode") == "research" else "Standard RAG"
+                        st.caption(mode_label)
+                    if message["role"] == "user":
+                        st.markdown(message["content"])
+                    else:
+                        for kind, content, language in answer_blocks(message["content"]):
+                            if kind == "code":
+                                st.code(content, language=language, line_numbers=True, wrap_lines=False)
+                            else:
+                                render_markdown_block(content)
+                    if message.get("evidence"):
+                        with st.expander(f"Sources ({len(message['evidence'])})", expanded=False):
+                            render_evidence_resources(
+                                message["evidence"],
+                                bib_pdf_dir=paths.bib_pdf,
+                                key_prefix=f"chat_evidence_{index}_{abs(hash(message['content']))}",
+                            )
+                    if message.get("artifacts"):
+                        render_artifacts(message["artifacts"], key_prefix=f"chat_artifacts_{index}")
+                    if message["role"] == "assistant":
+                        st.download_button(
+                            "Save answer", data=message["content"], file_name=f"answer_{index + 1}.md",
+                            mime="text/markdown", icon=":material/download:",
+                            key=f"save_answer_{index}", on_click="ignore",
+                        )
+
+            chat_activity = st.empty()
+
+        with st.container(key="rag_composer", border=False):
+            chat_mode = st.selectbox(
+                "Answer mode", ["standard", "research"],
+                index=0 if st.session_state.get("chat_mode", "standard") == "standard" else 1,
+                format_func=lambda mode: "Standard RAG" if mode == "standard" else "Research Mode",
+                key="rag_answer_mode", label_visibility="collapsed", width=220,
+                help="Standard RAG searches indexed passages. Research Mode follows document graph relationships.",
+            )
+            st.session_state["chat_mode"] = chat_mode
+            pending_question = st.chat_input(
+                "Ask a question about your papers...", key="multimodal_chat_input", width="stretch",
+                disabled=bool(st.session_state.get("chat_pending_question")),
+            )
+            pending_question = pending_question or st.session_state.pop("suggested_chat_question", None)
+
+    mount_chat_composer()
 
     queued_question = st.session_state.get("chat_pending_question", "").strip()
     if queued_question:
@@ -2721,7 +2932,7 @@ with tab_chat:
             artifacts = []
             evidence_refs = []
         else:
-            with st.spinner(
+            with chat_activity.container(), st.spinner(
                 (
                     f"Retrieving Qdrant evidence and synthesizing with {settings['backend']} / {settings['model']}..."
                     if queued_mode == "standard"
@@ -2729,7 +2940,12 @@ with tab_chat:
                 )
             ):
                 try:
-                    if queued_mode == "research":
+                    allowed, scope_message = evaluate_question(
+                        queued_question, selected_case, st.session_state["chat_messages"][:-1], llm_complete, settings
+                    )
+                    if not allowed:
+                        response = {"answer_markdown": scope_message}
+                    elif queued_mode == "research":
                         response = graph_chat_answer(
                             queued_question,
                             settings=settings,
@@ -2769,39 +2985,6 @@ with tab_chat:
         maybe_auto_sync_case(APP_DB_PATH, selected_case)
         st.rerun()
 
-    with st.container(key="rag_chat_surface", border=False, height=650):
-        if not st.session_state["chat_messages"]:
-            st.info("Ask a question after indexing the case. Evidence, PDF references, tables, and figures will appear inline with each answer.")
-        for index, message in enumerate(st.session_state["chat_messages"]):
-            with st.chat_message(message["role"]):
-                if message["role"] == "assistant":
-                    mode_label = "Research Mode" if message.get("mode") == "research" else "Standard RAG"
-                    st.markdown(f'<span class="rag-mode-pill">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
-                render_markdown_block(message["content"])
-                if message.get("evidence"):
-                    render_evidence_resources(
-                        message["evidence"],
-                        bib_pdf_dir=paths.bib_pdf,
-                        key_prefix=f"chat_evidence_{index}_{abs(hash(message['content']))}",
-                    )
-                if message.get("artifacts"):
-                    render_artifacts(message["artifacts"])
-
-    pending_question = st.chat_input(
-        "Ask a high-precision question about papers, datasets, methods, tables, and figures...",
-        key="multimodal_chat_input",
-        width="stretch",
-    )
-    chat_mode = st.radio(
-        "Reasoning mode",
-        [("standard", "🧠 Standard RAG"), ("research", "🕸 Research Mode")],
-        index=0 if st.session_state.get("chat_mode", "standard") == "standard" else 1,
-        format_func=lambda item: item[1],
-        key="chat_mode_selector_inline",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.session_state["chat_mode"] = chat_mode[0]
     if pending_question:
         st.session_state["chat_messages"].append(
             {

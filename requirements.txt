@@ -1,4 +1,6 @@
-streamlit>=1.35.0
+streamlit>=1.57.0,<2
+markdown-it-py>=3.0.0,<5
+Pygments>=2.18.0,<3
 gpt-researcher==0.14.8
 openai>=1.75.0
 python-dotenv==1.2.2

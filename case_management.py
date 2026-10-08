@@ -124,7 +124,9 @@ def init_db(database_path: Path) -> None:
 def list_cases(database_path: Path) -> list[CaseRecord]:
     with connect(database_path) as conn:
         rows = conn.execute("SELECT * FROM cases ORDER BY is_legacy DESC, updated_at DESC, name ASC").fetchall()
-    return [row_to_case(row) for row in rows if row_to_case(row) is not None]
+    # Preserve history, but never recreate manually removed study directories.
+    cases = [row_to_case(row) for row in rows]
+    return [case for case in cases if case is not None and Path(case.root_dir).is_dir()]
 
 
 def get_case_by_slug(database_path: Path, slug: str) -> CaseRecord | None:

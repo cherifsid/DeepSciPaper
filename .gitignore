@@ -19,14 +19,39 @@ multimodal_store/
 scientific_graph_rag_store/
 cases/
 app_state/
+# Local databases and SQLite transaction files (schema code stays tracked).
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+# Local environments, caches and machine credentials.
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.aws/
+.DS_Store
+Thumbs.db
 __pycache__/
 .streamlit/secrets.toml
 logs/
 bib_pdf/
+!/results exemples/bib_pdf/
+!/results exemples/bib_pdf/*.pdf
 *.Zone.Identifier
 Screenshot*.png
 today.png
-__pycache__/
 .ipynb_checkpoints/
 .codex/
 .agents/

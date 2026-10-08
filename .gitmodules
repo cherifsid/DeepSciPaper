@@ -1,0 +1,3 @@
+[submodule "engines/gpt-researcher"]
+    path = engines/gpt-researcher
+    url = https://github.com/cherifsid/gpt-researcher.git

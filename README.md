@@ -4,6 +4,22 @@
 
 DeepSciPaper is a case-based scientific research copilot for students and researchers who need to discover literature, index papers locally, inspect artifacts, and discuss evidence with a grounded AI assistant.
 
+### Search & Model Ecosystem
+
+**Search and discovery**
+
+| <img src="asset/providers/tavily.svg" width="28" height="28" alt="Tavily logo"> Tavily | <img src="asset/providers/duckduckgo.svg" width="28" height="28" alt="DuckDuckGo logo"> DuckDuckGo | <img src="asset/providers/arxiv.svg" width="28" height="28" alt="arXiv logo"> arXiv | <img src="asset/providers/semanticscholar.svg" width="28" height="28" alt="Semantic Scholar logo"> Semantic Scholar |
+| :---: | :---: | :---: | :---: |
+
+**Model ecosystem**
+
+| <img src="asset/providers/ollama.svg" width="28" height="28" alt="Ollama logo"> Ollama | <img src="asset/providers/qwen.svg" width="28" height="28" alt="Qwen logo"> Qwen | <img src="asset/providers/kimi.svg" width="28" height="28" alt="Kimi logo"> Kimi | <img src="asset/providers/openai.svg" width="28" height="28" alt="OpenAI logo"> OpenAI | <img src="asset/providers/gemini.svg" width="28" height="28" alt="Gemini logo"> Gemini | <img src="asset/providers/deepseek.svg" width="28" height="28" alt="DeepSeek logo"> DeepSeek |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+
+The application provides **Local Ollama** and **Cloud API** backends, with built-in OpenAI and DeepSeek provider choices. Other model families require an available Ollama model or a compatible cloud endpoint, credentials, and model name. These logos describe the ecosystem, not a guarantee that every model or provider-specific feature is supported.
+
+> **Tavily setup:** Copy `.env.example` to `.env`, then set `TAVILY_API_KEY` to your Tavily key for Tavily-backed Deep Search. This search credential is separate from your LLM API key. Other retrievers remain available; never commit your `.env` file.
+
 It focuses on four workflows:
 
 - agentic deep literature search
@@ -18,6 +34,13 @@ The app is built around one practical idea: every research case should be reprod
 <p align="center">
   <img src="asset/demo 1.gif" alt="App Demo" width="90%">
 </p>
+
+
+## Explore A Research Example
+
+See the [image segmentation example](results%20exemples/README.md) for the original prompt, a saved Deep Search report, and 14 downloadable PDFs. Start with the example guide, then inspect the report alongside its source documents. The guide also shows how to index these papers in a new study and test both chat modes.
+
+This is a preserved, unreviewed model output with documented limitations, including placeholder repository links; it is not a verified benchmark or literature review.
 
 ## Current Product Surface
 
@@ -157,6 +180,8 @@ flowchart LR
 
 The chat tab has two retrieval modes. Both render through the same modern answer surface with markdown, tables, code blocks, evidence popovers, PDF previews, and artifact references.
 
+The chat uses the main page scrollbar, without a nested conversation scrollbar. Its composer stays pinned to the bottom of the active chat view, with an answer-mode selector and send control. Messages use the available content width, and the final answer remains accessible above the composer. Library/indexing operations open separately, so they do not expand over the conversation. Sources are grouped per answer; figures and tables open as previews with downloads. Use **Save answer** for Markdown export or **Conversation actions** to export the transcript or confirm clearing saved messages.
+
 ### Standard RAG
 
 Standard RAG is the faster path.
@@ -184,6 +209,39 @@ It uses:
 - synthesis with the active UI-selected model
 
 Best for section-aware reasoning, table/figure/text linkage, structured scientific answers, and higher interpretability.
+
+## Case Navigation And Chat Scope
+
+Case selection uses a stable selector and callbacks. Switching studies reloads the selected study's saved conversation and clears pending questions and draft search plans. Model settings remain available in the sidebar. Home and case-creation actions share the same navigation state. Graph counts are read from filenames, without loading complete graphs on each UI interaction.
+
+Both chat modes run a relevance check before retrieval and answer generation. The configured Ollama/cloud model evaluates the question against the study's name, description and research goal, plus recent conversational context. Describe the study clearly when creating or editing it; this is its subject boundary.
+
+- Unrelated or mixed-topic questions receive a short out-of-subject message.
+- Related algorithm implementations and follow-up questions are allowed.
+- Invalid classifier output, missing scope, or model errors stop answer generation rather than bypassing the check.
+- The check adds one small model request per question. It is a model-based safeguard, not a mathematical guarantee of perfect topic classification; validate it with your own in-domain and off-topic examples.
+
+No additional API key is needed for scope evaluation: it uses the selected backend and credentials. Cloud evaluation sends the case description, question and bounded conversation context to that provider.
+
+## Coding Answers
+
+Fenced code in assistant replies is rendered as native syntax-highlighted code cells with line numbers and a copy control. Common aliases such as `py`, `js`, and `sh` are normalized; unknown language labels fall back to plain text. Code is displayed, never executed. Prose, equations, evidence links and tables stay outside the code cell. Suggested implementations should be checked against the cited paper before use.
+
+Install updated dependencies in the app environment:
+
+```bash
+conda activate research_copilot
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The UI requires Streamlit 1.57 or newer (below 2). Markdown parsing uses `markdown-it-py`; language validation uses `Pygments`. Existing credentials remain in `.env`; there are no new secrets for these features.
+
+## Proposed Deep Search Quality Gate (Not Implemented)
+
+A possible next stage would deduplicate search candidates, rank their titles/abstracts against the approved research facets, and retain direct and supporting evidence separately. Only accepted candidates would proceed to download, followed by a full-text relevance check before synthesis. Missing coverage could trigger a bounded additional search while preserving the user's original requirements.
+
+This remains a proposal. Cross-encoder thresholds, retry budgets, model choice, and evaluation criteria need agreement before implementation; no reranker or automatic retry-search pipeline is enabled by this update.
 
 ## How Graph RAG Works
 
@@ -429,3 +487,7 @@ python scientific_graph_rag.py query \
 ## Current State
 
 This branch is the case-managed research workspace with login, case management, SQLite persistence, MinIO sync hooks, automatic graph build after multimodal indexing, and dual RAG chat modes. The product is focused on discovery, indexing, evidence inspection, and research chat.
+
+### Logo Credits
+
+Provider marks belong to their respective owners. Local logo assets are sourced from [LobeHub Icons](https://github.com/lobehub/lobe-icons) and [Simple Icons](https://github.com/simple-icons/simple-icons). Their inclusion identifies services and model families; it does not imply endorsement.

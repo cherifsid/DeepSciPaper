@@ -1,0 +1,1 @@
+Find primary literature, datasets, benchmark studies, and repositories relevant to image segmentation Stat of the art. Prioritize PDFs, scholarly sources, and reproducible methods.

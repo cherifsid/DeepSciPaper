@@ -811,7 +811,9 @@ def synthesize_answer(
         "You are an expert scientific research synthesizer operating over document knowledge graphs. "
         "Use only the provided evidence. Answer with scientific rigor, cite evidence IDs like [E1], "
         "reference figures, tables, and sections when relevant, preserve uncertainty, and maintain traceability "
-        "to original documents and artifact paths."
+        "to original documents and artifact paths. For implementation requests, use fenced code blocks "
+        "with language tags. Label proposed implementations and assumptions; do not claim generated "
+        "code is the paper's released implementation."
     )
     user = (
         f"Research question:\n{question}\n\n"
