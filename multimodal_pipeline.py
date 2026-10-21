@@ -136,16 +136,17 @@ def run_mineru(
     # MinerU 2.x+ (4.0.12) uses a completely different CLI with 'parse' subcommand
     # Old CLI: mineru -p <pdf> -o <output> -b <backend> -m <method> -l <lang>
     # New CLI: mineru parse <pdf> --output <output> --tier <tier> --format <format> --json --pages all
+    # Tiers: flash (local, no server), basic/standard/advanced (require server)
     if Path(command_name).name == "mineru":
         # Map old backend/method to new tier system
-        # pipeline + auto -> standard (balanced quality/speed)
-        tier = "standard"
+        # Use 'flash' for local parsing (works without server)
+        tier = "flash"
         if backend == "pipeline" and method == "auto":
-            tier = "standard"
+            tier = "flash"
         elif backend == "pipeline" and method == "ocr":
-            tier = "advanced"
+            tier = "flash"  # flash supports OCR locally
         elif backend == "pipeline" and method == "txt":
-            tier = "basic"
+            tier = "flash"
 
         command = [
             command_name,

@@ -2941,7 +2941,7 @@ with tab_chat:
             ):
                 try:
                     allowed, scope_message = evaluate_question(
-                        queued_question, selected_case, st.session_state["chat_messages"][:-1], llm_complete, settings
+                        queued_question, selected_case, st.session_state["chat_messages"][:-1], llm_complete, settings, multimodal_store_path
                     )
                     if not allowed:
                         response = {"answer_markdown": scope_message}

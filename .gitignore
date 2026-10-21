@@ -56,3 +56,6 @@ today.png
 .codex/
 .agents/
 .git-backups/
+.claude/
+CLAUDE.md
+ graphify-out/
