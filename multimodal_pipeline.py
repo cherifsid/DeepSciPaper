@@ -132,24 +132,40 @@ def run_mineru(
 
     output_dir = doc_dir / "mineru"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # MinerU 2.x+ (4.0.12) uses a completely different CLI with 'parse' subcommand
+    # Old CLI: mineru -p <pdf> -o <output> -b <backend> -m <method> -l <lang>
+    # New CLI: mineru parse <pdf> --output <output> --tier <tier> --format <format> --json --pages all
     if Path(command_name).name == "mineru":
+        # Map old backend/method to new tier system
+        # pipeline + auto -> standard (balanced quality/speed)
+        tier = "standard"
+        if backend == "pipeline" and method == "auto":
+            tier = "standard"
+        elif backend == "pipeline" and method == "ocr":
+            tier = "advanced"
+        elif backend == "pipeline" and method == "txt":
+            tier = "basic"
+
         command = [
             command_name,
-            "-p",
+            "parse",
             str(pdf_path),
-            "-o",
+            "--output",
             str(output_dir),
-            "-b",
-            backend,
-            "-m",
-            method,
-            "-l",
-            lang,
+            "--tier",
+            tier,
+            "--format",
+            "markdown",
+            "--json",
+            "--pages",
+            "all",
         ]
     else:
+        # Fallback for magic-pdf (old MinerU 1.x) if ever available
         command = [command_name, "-p", str(pdf_path), "-o", str(output_dir)]
 
-    LOGGER.info("MinerU start | pdf=%s | backend=%s | method=%s | lang=%s", pdf_path.name, backend, method, lang)
+    LOGGER.info("MinerU start | pdf=%s | tier=%s | lang=%s", pdf_path.name, tier, lang)
     LOGGER.info("MinerU command | %s", " ".join(command))
     result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False)
     LOGGER.info("MinerU finished | pdf=%s | returncode=%s", pdf_path.name, result.returncode)
